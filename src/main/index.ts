@@ -585,6 +585,10 @@ if (process.env['DECKWERK_HEADLESS_TEST'] === '1') {
     'disable-background-media-suspend',
   ]) app.commandLine.appendSwitch(flag);
   app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required');
+  // Nothing in this mode is meant to be seen, the app included: a test run
+  // launches it dozens of times, and each launch would otherwise put an icon
+  // in the developer's macOS Dock for as long as its suite runs.
+  if (process.platform === 'darwin') app.dock.hide();
 }
 
 app.whenReady().then(async () => {

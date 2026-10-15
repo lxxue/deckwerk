@@ -16,6 +16,9 @@ protocol.registerSchemesAsPrivileged([{ scheme: 'deck', privileges: {
   standard: true, secure: true, supportFetchAPI: true, stream: true,
 } }]);
 app.disableHardwareAcceleration();
+// A helper, not an app: keep it out of the macOS Dock, where every run would
+// otherwise put an Electron icon for as long as it lasts.
+if (process.platform === 'darwin') app.dock.hide();
 app.on('window-all-closed', () => {});
 
 app.whenReady().then(async () => {

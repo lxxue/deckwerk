@@ -18,6 +18,9 @@ const { app, BrowserWindow } = require('electron');
 const job = JSON.parse(readFileSync(process.argv[2], 'utf8'));
 
 app.disableHardwareAcceleration();
+// A helper, not an app: keep it out of the macOS Dock, where every run would
+// otherwise put an Electron icon for as long as it lasts.
+if (process.platform === 'darwin') app.dock.hide();
 
 app.whenReady().then(async () => {
   const win = new BrowserWindow({

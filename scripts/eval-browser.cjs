@@ -19,6 +19,9 @@ app.commandLine.appendSwitch('disable-background-timer-throttling');
 app.commandLine.appendSwitch('disable-renderer-backgrounding');
 app.commandLine.appendSwitch('disable-backgrounding-occluded-windows');
 app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required');
+// Hidden windows, hidden app: a test run launches this browser dozens of times,
+// and each launch would otherwise flash an Electron icon in the macOS Dock.
+if (process.platform === 'darwin') app.dock.hide();
 
 let mainWindow;
 app.whenReady().then(async () => {

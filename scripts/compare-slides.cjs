@@ -25,6 +25,9 @@ const SETTLE_MS = job.settleMs ?? 400;
 const CHANNEL_TOLERANCE = job.channelTolerance ?? 24;
 
 app.disableHardwareAcceleration();
+// A helper, not an app: keep it out of the macOS Dock, where every run would
+// otherwise put an Electron icon for as long as it lasts.
+if (process.platform === 'darwin') app.dock.hide();
 
 app.whenReady().then(async () => {
   mkdirSync(job.outDir, { recursive: true });
