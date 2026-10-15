@@ -2,6 +2,7 @@ import { spawn, type ChildProcess } from 'node:child_process';
 import { mkdir, symlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { build } from 'electron-vite';
+import { backgroundElectronBinary } from '../../src/cli/backgroundElectron.js';
 import { collectProcessOutput, electronBinary, reportedPorts, type DevToolsTarget } from './browserSession.js';
 import { collabClientDir, enableRenderInvariants, sharedBuild } from './collabClient.js';
 
@@ -104,13 +105,16 @@ export interface RunningApp {
  * `visible` (the opt-in OS-level input smoke test needs a frontmost window).
  * `args` follow Electron's own switches — typically the deck folder to open.
  */
-export function launchDesktopApp(appDir: string, args: string[], options: {
+export async function launchDesktopApp(appDir: string, args: string[], options: {
   profileDir: string;
   cwd?: string;
   env?: Record<string, string>;
   visible?: boolean;
 }): Promise<RunningApp> {
-  const child = spawn(electronBinary, [
+  // A visible app is the OS-input tier's: it needs to be a regular,
+  // frontmost app with a menu bar, so it keeps its Dock icon.
+  const binary = options.visible ? electronBinary : await backgroundElectronBinary(electronBinary);
+  const child = spawn(binary, [
     appDir,
     // Chromium picks the port; see `reportedPorts`.
     '--remote-debugging-port=0',

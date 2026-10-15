@@ -6,6 +6,7 @@ import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { backgroundElectronBinary } from '../src/cli/backgroundElectron.js';
 import { exportDeck } from '../src/main/exportDeck.js';
 import { loadDeck } from '../src/main/deckStore.js';
 import { pdfSteps } from '../src/shared/pdfExport.js';
@@ -169,9 +170,10 @@ describe.skipIf(runnable)('PDF pages, against the real Player (skipped)', () => 
   it('needs the built renderer, Electron, and PyMuPDF', () => expect(runnable).toBe(false));
 });
 
-function runElectron(script: string, jobPath: string): Promise<string> {
+async function runElectron(script: string, jobPath: string): Promise<string> {
+  const binary = await backgroundElectronBinary(electron);
   return new Promise((resolvePromise, reject) => {
-    const child = spawn(electron, [script, jobPath], {
+    const child = spawn(binary, [script, jobPath], {
       stdio: ['ignore', 'pipe', 'pipe'],
       env: { ...process.env, ELECTRON_DISABLE_SECURITY_WARNINGS: '1' },
     });

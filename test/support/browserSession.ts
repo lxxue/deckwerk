@@ -3,6 +3,7 @@ import { existsSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { join } from 'node:path';
 import WebSocket from 'ws';
+import { backgroundElectronBinary } from '../../src/cli/backgroundElectron.js';
 
 /**
  * Shared plumbing for the production-browser tests: launch a hidden Electron
@@ -917,7 +918,7 @@ export async function launchBrowser(
   /** Extra Electron switches, e.g. `--inspect=0` for the main process. */
   electronArgs: string[] = [],
 ): Promise<RunningBrowser> {
-  const child = spawn(electronBinary, [
+  const child = spawn(await backgroundElectronBinary(electronBinary), [
     join(process.cwd(), 'scripts/eval-browser.cjs'),
     url,
     // Chromium picks the port; see `reportedPorts`.

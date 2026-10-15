@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { Deck } from '@shared/deck.js';
 import { exportDeck } from '../main/exportDeck.js';
+import { backgroundElectronBinary } from './backgroundElectron.js';
 import { electronFailure, headlessElectronArgs } from './electronDisplay.js';
 
 /**
@@ -77,10 +78,11 @@ function compareScript(): string {
   return fileURLToPath(new URL('../../scripts/compare-slides.cjs', import.meta.url));
 }
 
-function runElectron(script: string, jobPath: string): Promise<string> {
+async function runElectron(script: string, jobPath: string): Promise<string> {
   const electron = createRequire(import.meta.url)('electron') as unknown as string;
+  const binary = await backgroundElectronBinary(electron);
   return new Promise((resolvePromise, reject) => {
-    const child = spawn(electron, [script, jobPath, ...headlessElectronArgs()], {
+    const child = spawn(binary, [script, jobPath, ...headlessElectronArgs()], {
       stdio: ['ignore', 'pipe', 'pipe'],
       env: { ...process.env, ELECTRON_DISABLE_SECURITY_WARNINGS: '1' },
     });

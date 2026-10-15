@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { backgroundElectronBinary } from '../src/cli/backgroundElectron.js';
 import { scratchpadDocument } from '../src/server/collabServer.js';
 import { slidesToHtml } from '../src/shared/htmlSlides.js';
 import { PLAYER_TYPE_CSS } from '../src/shared/playerTypeCss.js';
@@ -195,10 +196,11 @@ function importedPage(): string {
   return slidesToHtml(slides, { w: 1920, h: 1080 }, { typeCss: PLAYER_TYPE_CSS });
 }
 
-function runElectron(jobPath: string): Promise<void> {
+async function runElectron(jobPath: string): Promise<void> {
   const script = fileURLToPath(new URL('../scripts/compare-scratchpad.cjs', import.meta.url));
+  const binary = await backgroundElectronBinary(electron);
   return new Promise((resolve, reject) => {
-    const child = spawn(electron, [script, jobPath], {
+    const child = spawn(binary, [script, jobPath], {
       cwd: process.cwd(), stdio: ['ignore', 'pipe', 'pipe'],
       env: { ...process.env, ELECTRON_DISABLE_SECURITY_WARNINGS: '1' },
     });

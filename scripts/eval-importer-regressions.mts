@@ -5,6 +5,7 @@ import { createRequire } from 'node:module';
 import { join, resolve } from 'node:path';
 import { createDeck, saveDeck } from '../src/main/deckStore.js';
 import { exportDeck } from '../src/main/exportDeck.js';
+import { backgroundElectronBinary } from '../src/cli/backgroundElectron.js';
 import { compileHtmlToSlides, measureBuiltTextOverflows } from '../src/cli/compileHtml.js';
 
 const fixtures = [
@@ -181,11 +182,12 @@ await writeFile(join(root, 'summary.json'), JSON.stringify(summary, null, 2), 'u
 process.stdout.write(`${JSON.stringify(summary, null, 2)}\n`);
 if (failures.length > 0) throw new Error(`Importer regression failed:\n${failures.join('\n')}`);
 
-function runElectron(script: string, job: string): Promise<void> {
+async function runElectron(script: string, job: string): Promise<void> {
   const electron = createRequire(import.meta.url)('electron') as unknown as string;
   if (!existsSync(electron)) throw new Error('Electron is not installed');
+  const binary = await backgroundElectronBinary(electron);
   return new Promise((resolveRun, reject) => {
-    const child = spawn(electron, [script, job], {
+    const child = spawn(binary, [script, job], {
       stdio: ['ignore', 'pipe', 'pipe'],
       env: { ...process.env, ELECTRON_DISABLE_SECURITY_WARNINGS: '1' },
     });

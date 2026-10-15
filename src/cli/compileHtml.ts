@@ -16,6 +16,7 @@ import {
 import { PLAYER_TYPE_CSS } from '@shared/playerTypeCss.js';
 import { slidesFromMeasured, slidesToHtml, type MeasuredSlide } from '@shared/htmlSlides.js';
 import { loadTheme } from '../main/deckStore.js';
+import { backgroundElectronBinary } from './backgroundElectron.js';
 import { electronFailure, headlessElectronArgs } from './electronDisplay.js';
 
 /**
@@ -397,11 +398,12 @@ function draftRendererScript(): string {
   return fileURLToPath(new URL('../../scripts/render-html-draft.cjs', import.meta.url));
 }
 
-function runElectron(script: string, jobPath: string): Promise<string> {
+async function runElectron(script: string, jobPath: string): Promise<string> {
   const electron = createRequire(import.meta.url)('electron') as unknown as string;
   if (!existsSync(electron)) throw new Error(`Electron is not installed at ${electron}`);
+  const binary = await backgroundElectronBinary(electron);
   return new Promise((resolvePromise, reject) => {
-    const child = spawn(electron, [script, jobPath, ...headlessElectronArgs()], {
+    const child = spawn(binary, [script, jobPath, ...headlessElectronArgs()], {
       stdio: ['ignore', 'pipe', 'pipe'],
       env: { ...process.env, ELECTRON_DISABLE_SECURITY_WARNINGS: '1' },
     });

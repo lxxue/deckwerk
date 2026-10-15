@@ -24,7 +24,10 @@ it under the default config also works but is not what CI does.
 
 Desktop-app suites launch the REAL app from one shared electron-vite build
 (test/support/desktopApp.ts), cached under the OS temp directory by source
-hash, with every window hidden. Never point a test at the checkout's `out/`
+hash, with every window hidden. On macOS every hidden Electron — test or CLI
+helper — starts from a clone of Electron.app that declares `LSUIElement`, so
+it never shows a Dock icon; spawn a new one through `backgroundElectronBinary`
+(src/cli/backgroundElectron.ts), which `test/electronDockIcon.test.ts` enforces. Never point a test at the checkout's `out/`
 directory — that is whatever was last built by hand — and never leave a suite
 skipping itself when a build is missing.
 

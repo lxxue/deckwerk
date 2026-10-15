@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url';
 import type { Deck } from '@shared/deck.js';
 import { exportDeck } from '../main/exportDeck.js';
 import { tempDir } from './agentCli.js';
+import { backgroundElectronBinary } from './backgroundElectron.js';
 import { electronFailure, headlessElectronArgs } from './electronDisplay.js';
 
 /**
@@ -183,9 +184,10 @@ export interface WebPageCheck {
   durationMs: number;
 }
 
-function runElectron(script: string, jobPath: string): Promise<string> {
+async function runElectron(script: string, jobPath: string): Promise<string> {
+  const binary = await backgroundElectronBinary(electronBinary());
   return new Promise((resolvePromise, reject) => {
-    const child = spawn(electronBinary(), [script, jobPath, ...headlessElectronArgs()], {
+    const child = spawn(binary, [script, jobPath, ...headlessElectronArgs()], {
       stdio: ['ignore', 'pipe', 'pipe'],
       env: { ...process.env, ELECTRON_DISABLE_SECURITY_WARNINGS: '1' },
     });
