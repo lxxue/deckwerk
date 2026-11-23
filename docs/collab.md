@@ -544,6 +544,12 @@ the participant id.
 - **Sidebar tabs** — Props, Theme (the full preset gallery + adoption
   controls, shared code with the desktop app), Build, History. Restoring a
   history snapshot broadcasts as an ordinary transaction.
+- **Hiding the sidebar** — the button at the toolbar's right end hides the
+  sidebar and its open tab so the canvas takes their width, as it does in the
+  desktop app (`src/renderer/editor/sidePanelToggle.ts`). It is a view
+  preference kept in the browser, not part of the deck. While the sidebar is
+  hidden, Chat cannot mark messages read, so its unread count shows on that
+  button instead.
 
 ## Local development
 

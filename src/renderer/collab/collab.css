@@ -410,7 +410,10 @@ button.bar-person:focus-visible { outline: 2px solid var(--accent); outline-offs
   color: var(--muted);
 }
 .chat-bell[aria-pressed="true"] { color: var(--accent-text, var(--accent)); border-color: var(--accent); }
-#side-tabs button .chat-tab-badge {
+/* Chat's unread count: on its tab, and on the toolbar's side-panel toggle
+   while the panel (and the tab with it) is hidden. */
+#side-tabs button .chat-tab-badge,
+.side-panel-toggle .chat-tab-badge {
   display: inline-block;
   min-width: 16px;
   margin-left: 4px;
@@ -423,7 +426,9 @@ button.bar-person:focus-visible { outline: 2px solid var(--accent); outline-offs
   line-height: 14px;
   text-align: center;
 }
-#side-tabs button .chat-tab-badge.is-mention {
+.side-panel-toggle .chat-tab-badge { margin-left: 0; }
+#side-tabs button .chat-tab-badge.is-mention,
+.side-panel-toggle .chat-tab-badge.is-mention {
   background: var(--accent);
   border-color: var(--accent);
   color: var(--on-accent, #fff);

@@ -10,6 +10,7 @@ import { setIdSuffix } from '@shared/geometry.js';
 import { CANVAS_NOTICE_EVENT, EditorCanvas } from '../editor/canvas.js';
 import { SpeakerNotesDrawer } from '../editor/speakerNotesDrawer.js';
 import { CanvasRulers } from '../editor/rulers.js';
+import { createSidePanelToggle, onSidePanelShownChange, sidePanelShown } from '../editor/sidePanelToggle.js';
 import { createDeckWerkButton } from '../editor/aboutDialog.js';
 import { setCommentAuthor, setCommentLinks } from '../editor/comments.js';
 import { findComment } from '@shared/comments.js';
@@ -523,6 +524,13 @@ presence.onPeersChange = () => presenceBar.setPeers(presence.list());
 /* --- deck chat ---------------------------------------------------------------- */
 
 let chatSelf: { name: string; color: string } | null = null;
+/**
+ * Chat's unread messages, and how many of them mention this person. Declared
+ * before the panel: its constructor reports a first count (setChatBadge).
+ */
+let chatUnread = { unread: 0, mentions: 0 };
+/** The toolbar's side-panel button, once the toolbar is built. */
+let sidePanelToggle: HTMLButtonElement | null = null;
 const chatPanel = new ChatPanel(el('chat'), {
   deckId,
   send: (post) => bridge.sendChat(post),
@@ -592,22 +600,37 @@ function openCommentById(commentId: string): void {
 
 /** The Chat tab's unread count; accented when one of them mentions this person. */
 function setChatBadge(unread: number, mentions: number): void {
+  chatUnread = { unread, mentions };
   const tab = document.querySelector<HTMLButtonElement>('#side-tabs button[data-panel="chat"]');
-  if (!tab) return;
-  let badge = tab.querySelector<HTMLElement>('.chat-tab-badge');
+  if (tab) drawUnreadBadge(tab, unread, mentions, 'unread');
+  syncSidePanelToggleBadge();
+}
+
+/**
+ * The same count on the side-panel button while the panel is hidden, since
+ * the Chat tab is hidden with it and a mention would otherwise go unseen.
+ */
+function syncSidePanelToggleBadge(): void {
+  if (!sidePanelToggle) return;
+  const { unread, mentions } = sidePanelShown() ? { unread: 0, mentions: 0 } : chatUnread;
+  drawUnreadBadge(sidePanelToggle, unread, mentions, 'unread in Chat');
+}
+
+function drawUnreadBadge(host: HTMLElement, unread: number, mentions: number, what: string): void {
+  let badge = host.querySelector<HTMLElement>('.chat-tab-badge');
   if (unread === 0) {
     badge?.remove();
-    tab.removeAttribute('aria-description');
+    host.removeAttribute('aria-description');
     return;
   }
   if (!badge) {
     badge = document.createElement('span');
     badge.className = 'chat-tab-badge';
-    tab.append(badge);
+    host.append(badge);
   }
   badge.textContent = unread > 99 ? '99+' : String(unread);
   badge.classList.toggle('is-mention', mentions > 0);
-  tab.setAttribute('aria-description', `${unread} unread${mentions > 0 ? `, ${mentions} mentioning you` : ''}`);
+  host.setAttribute('aria-description', `${unread} ${what}${mentions > 0 ? `, ${mentions} mentioning you` : ''}`);
 }
 
 wireCanvasInspector(canvas, inspector);
@@ -1370,7 +1393,11 @@ function buildToolbar(): void {
       [{ label: 'Present in Speaker View', action: () => startPresentation(true) }],
       { variant: 'primary', menuLabel: 'Presentation options' },
     ),
+    divider(),
   );
+  sidePanelToggle = createSidePanelToggle();
+  right.append(sidePanelToggle);
+  syncSidePanelToggleBadge();
 
   bar.append(left, mid, right);
   installResponsiveToolbar(bar);
@@ -1404,16 +1431,32 @@ function buildTabs(): void {
 function showPanel(id: string): void {
   if (store.get().slideSelection.size > 1 && !DECK_LEVEL_PANELS.has(id)) return;
   activePanelId = id;
-  for (const panel of PANELS) el(panel.id).hidden = panel.id !== id;
-  for (const b of el('side-tabs').querySelectorAll('button')) {
-    b.classList.toggle('active', b.dataset.panel === id);
-  }
-  if (id === 'inspector') inspector.render();
+  syncPanels();
   if (id === 'themePanel') el('themePanel').scrollTop = 0;
-  if (id !== 'themePanel') designWorkspace.hide();
-  rail.setDesignLabels(id === 'themePanel');
-  canvas.setBuildBadgesVisible(id === 'timeline');
 }
+
+/**
+ * Put the active tab on screen, or, while the toolbar's toggle hides the side
+ * panel (sidePanelToggle.ts), no tab at all: the open one is hidden with the
+ * panel, as switching away from it would hide it -- so Chat stops marking
+ * messages read, and its unread count moves to the toggle -- and what it
+ * shows on the canvas and the rail goes too, until the panel comes back on
+ * the same tab.
+ */
+function syncPanels(): void {
+  const onScreen = sidePanelShown();
+  el('side').hidden = !onScreen;
+  for (const panel of PANELS) el(panel.id).hidden = !onScreen || panel.id !== activePanelId;
+  for (const b of el('side-tabs').querySelectorAll('button')) {
+    b.classList.toggle('active', b.dataset.panel === activePanelId);
+  }
+  if (onScreen && activePanelId === 'inspector') inspector.render();
+  if (!onScreen || activePanelId !== 'themePanel') designWorkspace.hide();
+  rail.setDesignLabels(onScreen && activePanelId === 'themePanel');
+  canvas.setBuildBadgesVisible(onScreen && activePanelId === 'timeline');
+  syncSidePanelToggleBadge();
+}
+onSidePanelShownChange(syncPanels);
 
 /** Multi-slide selection is a deck-level editing context: Theme and Props apply. */
 function syncSlideSelectionContext(): void {

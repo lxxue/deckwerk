@@ -28,7 +28,8 @@ import { sidebarSelectionProbes } from './support/selectionSession.js';
  * selection (which must ask first; cancelled, or confirmed and undone), and
  * resizing a selected word from the sidebar's Font size field, flipping
  * the selection from the sidebar, panning and zooming the view with a
- * plain mouse and the keyboard (each time also showing or hiding the
+ * plain mouse and the keyboard (each time with the side panel hidden from
+ * the toolbar, and also showing or hiding the
  * rulers), picking up the pen to put it down again or to draw a line
  * that is undone, a freehand Pencil stroke (Shift+P) that is undone,
  * a line from the Shape menu whose points are opened with a double-click
@@ -973,7 +974,8 @@ async function checkRouting(
  * Pan or zoom the view the way a plain mouse and the keyboard do it — a
  * Ctrl/Cmd wheel notch, Shift and the wheel, a middle-button drag, Space and
  * a drag, Ctrl/Cmd + or - — over a random object or the empty slide, mid-edit
- * or not. None of it is an edit: every object stays where it was, and the
+ * or not, with the side panel hidden from the toolbar for the gesture and
+ * shown again after it. None of it is an edit: every object stays where it was, and the
  * selection, the text edit and the slide are as they were. Nor may the page
  * itself zoom. Ctrl/Cmd+0 then fits the view again, so later ops aim at an
  * unpanned slide.
@@ -996,6 +998,17 @@ async function viewportGesture(
   })()`);
   const before = await snapshot();
   const ratio = await cdp.evaluate<number>('window.devicePixelRatio');
+  // Every gesture runs with the side panel hidden from the toolbar, mid-edit
+  // or not: the canvas takes the panel's column and refits, so the slide
+  // moves and grows before the aim below is taken. Like the rulers, this
+  // draws nothing from the walk's random stream, and the panel is back before
+  // the census, so the step's oracles see the editor they always saw.
+  const sidePanelShown = () => cdp.evaluate<boolean>(
+    `getComputedStyle(document.getElementById('side')).display !== 'none'`);
+  await cdp.click('#toolbar .side-panel-toggle', 'the side-panel toggle');
+  if (await sidePanelShown()) flag('routing', 'the side-panel toggle did not hide the side panel');
+  // The canvas refits from its ResizeObserver; two frames and it has.
+  await cdp.evaluate('new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)))');
   const targets = targetsOn(pre);
   const aim = targets.length > 0 && next() < 0.7
     ? await session.boxOf(elementSelector(pick(next, targets)))
@@ -1062,10 +1075,13 @@ async function viewportGesture(
   const rulersWere = await rulersShown();
   await cdp.click('#canvas .zoom-controls .rulers-toggle', 'the rulers toggle');
   if (await rulersShown() === rulersWere) flag('routing', 'the rulers toggle did not show or hide the rulers');
+  await cdp.click('#toolbar .side-panel-toggle', 'the side-panel toggle');
+  if (!(await sidePanelShown())) flag('routing', 'the side-panel toggle did not show the side panel again');
   await wait(120);
   const after = await snapshot();
   if (after !== before) {
-    flag('census', `${gesture} and the rulers toggle changed the deck or the editing state; diff: ${firstDiff(before, after)}`);
+    flag('census', `${gesture}, the rulers toggle and the side-panel toggle changed the deck or the editing state; `
+      + `diff: ${firstDiff(before, after)}`);
   }
   await session.chord('0', 'Digit0', 48, MOD);
   const view = await cdp.evaluate<{ zoom: string; ratio: number }>(`({

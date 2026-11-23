@@ -68,6 +68,7 @@ import { setRenderInvariantChecks } from './renderInvariants.js';
 import { setSelectionInvariantChecks } from './selectionInvariants.js';
 import { SpeakerNotesDrawer } from './speakerNotesDrawer.js';
 import { CanvasRulers, isRulersShortcut, toggleRulers } from './rulers.js';
+import { createSidePanelToggle, onSidePanelShownChange, sidePanelShown } from './sidePanelToggle.js';
 import { LightTable } from './lightTable.js';
 import { applySpeakerNotes } from '@shared/speakerNotes.js';
 import { installResponsiveToolbar } from './responsiveToolbar.js';
@@ -670,6 +671,8 @@ function buildToolbar(): void {
       [{ label: 'Present in Speaker View', action: () => void startPresentation(true) }],
       { variant: 'primary', menuLabel: 'Presentation options' },
     ),
+    barDivider(),
+    createSidePanelToggle(),
   );
 
   bar.append(left, mid, right);
@@ -1487,18 +1490,32 @@ let activePanelId = 'inspector';
 function showPanel(id: string): void {
   if (store.get().slideSelection.size > 1 && id !== 'themePanel' && id !== 'inspector') return;
   activePanelId = id;
+  syncPanels();
+  if (id === 'themePanel') el('themePanel').scrollTop = 0;
+}
+
+/**
+ * Put the active tab on screen, or, while the toolbar's toggle hides the side
+ * panel (sidePanelToggle.ts), no tab at all: the open one is hidden with the
+ * panel, as switching away from it would hide it, and what it shows on the
+ * canvas and the rail (build badges, layout names) goes too, until the panel
+ * comes back on the same tab.
+ */
+function syncPanels(): void {
+  const onScreen = sidePanelShown();
+  el('side').hidden = !onScreen;
   for (const panel of PANELS) {
-    el(panel.id).hidden = panel.id !== id;
+    el(panel.id).hidden = !onScreen || panel.id !== activePanelId;
   }
   for (const b of el('side-tabs').querySelectorAll('button')) {
-    b.classList.toggle('active', b.dataset.panel === id);
+    b.classList.toggle('active', b.dataset.panel === activePanelId);
   }
-  if (id === 'inspector') inspector.render();
-  if (id === 'themePanel') el('themePanel').scrollTop = 0;
-  if (id !== 'themePanel') designWorkspace.hide();
-  rail.setDesignLabels(id === 'themePanel');
-  canvas.setBuildBadgesVisible(id === 'timeline');
+  if (onScreen && activePanelId === 'inspector') inspector.render();
+  if (!onScreen || activePanelId !== 'themePanel') designWorkspace.hide();
+  rail.setDesignLabels(onScreen && activePanelId === 'themePanel');
+  canvas.setBuildBadgesVisible(onScreen && activePanelId === 'timeline');
 }
+onSidePanelShownChange(syncPanels);
 
 /** Multi-slide selection is a deck-level editing context: Theme and Props (Morph) apply. */
 function syncSlideSelectionContext(): void {

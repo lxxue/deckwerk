@@ -163,6 +163,15 @@ body.welcome-mode .toolbar-expanded-file-actions { display: inline-flex; }
   gap: 6px;
 }
 
+/* The side-panel toggle at the toolbar's right end (sidePanelToggle.ts):
+   icon-only, as tall as the buttons beside it, its icon's right-hand pane
+   filled in while the panel shows. */
+.side-panel-toggle {
+  align-self: stretch;
+  padding: 0 9px;
+}
+.side-panel-toggle[aria-pressed="false"] .side-panel-toggle-pane { display: none; }
+
 .bar-icon { flex: none; color: var(--muted); }
 
 button {
@@ -236,6 +245,11 @@ body.welcome-mode .deck-only { display: none; }
   overflow: hidden;
   border-left: 1px solid var(--line);
 }
+
+/* The side panel hidden from the toolbar (sidePanelToggle.ts): the canvas
+   takes its column, and its resize divider goes with it. */
+#side[hidden],
+#side[hidden] ~ .panel-resize-side { display: none; }
 
 .panel-resize-handle {
   position: absolute;
@@ -4429,6 +4443,9 @@ select.panel-action-select {
   left: auto;
   white-space: nowrap;
 }
+/* Present is no longer the last control once the side-panel toggle follows
+   it: its menu opens under Present itself rather than reaching past it. */
+.bar-right > .toolbar-split-button:not(:last-child) > .shape-menu.toolbar-split-popover { right: 0; }
 
 .shape-menu {
   position: absolute;
