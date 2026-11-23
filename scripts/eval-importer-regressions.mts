@@ -7,6 +7,7 @@ import { createDeck, saveDeck } from '../src/main/deckStore.js';
 import { exportDeck } from '../src/main/exportDeck.js';
 import { backgroundElectronBinary } from '../src/cli/backgroundElectron.js';
 import { compileHtmlToSlides, measureBuiltTextOverflows } from '../src/cli/compileHtml.js';
+import { electronChildEnv } from '../src/cli/electronDisplay.js';
 
 const fixtures = [
   {
@@ -189,7 +190,7 @@ async function runElectron(script: string, job: string): Promise<void> {
   return new Promise((resolveRun, reject) => {
     const child = spawn(binary, [script, job], {
       stdio: ['ignore', 'pipe', 'pipe'],
-      env: { ...process.env, ELECTRON_DISABLE_SECURITY_WARNINGS: '1' },
+      env: electronChildEnv(),
     });
     let error = '';
     child.stderr.on('data', (chunk) => { error += chunk; });

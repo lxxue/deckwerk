@@ -20,7 +20,12 @@ const YEAR = new Date().getFullYear();
  * neither is useful: a signed-but-unnotarized app is refused by Gatekeeper
  * exactly like an unsigned one, so there is no partial mode worth supporting.
  */
-const macSigned = Boolean(process.env.CSC_LINK && process.env.APPLE_ID && process.env.APPLE_TEAM_ID);
+const macSigned = Boolean(
+  process.env.CSC_LINK &&
+    process.env.APPLE_ID &&
+    process.env.APPLE_APP_SPECIFIC_PASSWORD &&
+    process.env.APPLE_TEAM_ID,
+);
 
 /**
  * Azure Trusted Signing. electron-builder drives it through the TrustedSigning
@@ -47,7 +52,17 @@ module.exports = {
   // Every platform ships the frozen Keynote importer, which carries its own
   // Python. scripts/assert-importer-fresh.cjs fails the pack if it is missing
   // or stale, so this path is never allowed to be absent.
-  extraResources: [{ from: 'build/importers', to: 'importers' }],
+  // The tutorial deck and the feature reference agents read (FEATURES.md);
+  // the app copies it into the person's profile to open it. src/main/tutorial.ts.
+  extraResources: [
+    { from: 'build/importers', to: 'importers' },
+    { from: 'resources/tutorial', to: 'tutorial', filter: ['deck.json', 'theme.css', 'FEATURES.md', 'assets/**/*'] },
+  ],
+  // deckwerk://tutorial/<slide-id> opens the tutorial on a slide; an agent
+  // answering a question about a feature links the person there. macOS reads
+  // this from Info.plist and Linux from the .desktop file; Windows registers
+  // it at runtime (app.setAsDefaultProtocolClient).
+  protocols: [{ name: 'DeckWerk tutorial link', schemes: ['deckwerk'] }],
   beforePack: 'scripts/assert-importer-fresh.cjs',
   // Without a Developer ID the mac app is ad-hoc signed here instead, so it
   // still verifies and runs; see the script for why skipping signing broke it.
@@ -80,8 +95,18 @@ module.exports = {
     target: ['dmg', 'zip'],
     hardenedRuntime: macSigned,
     gatekeeperAssess: false,
+    // The signer walks the whole bundle and signs every Mach-O it finds with
+    // `entitlementsInherit`: Electron's helpers, but also the frozen importers
+    // in Resources/importers and ffmpeg/ffprobe in app.asar.unpacked. Each
+    // gets the hardened runtime and a secure timestamp, which notarization
+    // demands of every executable in the app, not just the main one.
     entitlements: 'packaging/entitlements.mac.plist',
     entitlementsInherit: 'packaging/entitlements.mac.plist',
+    // notarytool, reading APPLE_ID, APPLE_APP_SPECIFIC_PASSWORD and
+    // APPLE_TEAM_ID from the environment. It notarizes the signed .app and
+    // staples the ticket to it before the dmg and zip are made, so both carry
+    // an app Gatekeeper accepts offline. scripts/verify-mac-release.sh checks
+    // the shipped artifacts afterwards.
     notarize: macSigned,
     // `null` means "do not sign at all". Without it electron-builder hunts the
     // keychain for any Developer ID and fails the build when it finds none.
@@ -132,7 +157,7 @@ module.exports = {
     vendor: 'Vincent Sitzmann',
     synopsis: 'WYSIWYG slide editor with first-class video support',
     description:
-      'DeckWerk is an opinionated cross-platform WYSIWYG slide editor, optimized for ' +
+      'DeckWerk is an open-source, cross-platform WYSIWYG slide editor, optimized for ' +
       'presentations centered on video and image content, with native support for ' +
       'agent-assisted authoring and account-free collaboration on trusted networks.',
     desktop: {

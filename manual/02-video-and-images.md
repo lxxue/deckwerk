@@ -22,6 +22,10 @@ Select a video, then drag the **Start** and **End** controls under **Props → T
 
 Use **Reset trim** to restore the full clip.
 
+### Speed
+
+**Props → Playback → Speed** sets how fast a video plays: 2 plays it twice as fast, 0.5 at half speed. Clear the field to go back to normal speed. Like the trim, speed leaves the file alone, and the trim still counts the file's own seconds. Videos that play in sync share one speed, so changing it on one changes it on all of them. While presenting, the speed keys still speed up or slow down the slide on top of this.
+
 > Screenshot placeholder: The video trim controls and frame preview.
 
 ### Crop
@@ -39,6 +43,20 @@ Under **Props → Effects**, choose **Blur**, **Posterize**, or **Greyscale**. A
 Effects work on both images and videos.
 
 > Screenshot placeholder: Media with two effects applied.
+
+### Compare two clips
+
+Select two videos (or two pictures) and click **Wipe** in the chip that appears under them, or right-click and choose **Arrange as wipe**. They are stacked in one box, split by a divider: the left-hand one shows left of it, the other right of it. Videos are set to play in sync. While presenting, drag the divider to move it.
+
+When the two clips differ in length, choose how long they run with **Length**, in the same chip or under **Props → Wipe**:
+
+- **Shortest** cuts both to the shorter clip, so they loop together. This is the default.
+- **Hold last** runs to the longer clip; the shorter one freezes on its last frame until the longer one finishes.
+- **Black** runs to the longer clip; the shorter one goes black.
+
+Each clip's length is its trimmed range. Videos side by side can play in sync too: select them and turn on **Play in sync** under **Props**, where the same **Length** choice appears.
+
+> Screenshot placeholder: Two clips arranged as a wipe, with the Length chip.
 
 ### Download the original
 

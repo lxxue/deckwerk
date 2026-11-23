@@ -1,11 +1,13 @@
 import { existsSync } from 'node:fs';
-import { mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, rm, stat } from 'node:fs/promises';
 import { dirname, extname, join, relative, resolve } from 'node:path';
 import type { Deck, Slide } from '@shared/deck.js';
 import type { WebExportQuality } from '@shared/ipc.js';
 import { loadTheme, resolveAsset } from './deckStore.js';
 import { encodeImageWebp, probeImage, probeMedia, transcodeVideoForWeb } from './ffmpeg.js';
 import { copyFileStreamed } from './copyFileStreamed.js';
+import { exportPlayerDir, exportPlayerUnavailableReason } from './exportPlayer.js';
+import { writeFileNamed } from './writeFailure.js';
 
 /**
  * Export a deck as a self-contained folder that opens in any browser.
@@ -21,29 +23,16 @@ import { copyFileStreamed } from './copyFileStreamed.js';
  * a web host without anyone in the audience noticing.
  */
 
-/** Where the export player bundle lives, in dev and when packaged. */
-function playerBundleDir(): string {
-  const candidates = [
-    join(import.meta.dirname, '../export'),
-    join(import.meta.dirname, '../../out/export'),
-    join(process.cwd(), 'out/export'),
-  ];
-  return candidates.find((dir) => existsSync(join(dir, 'player.js'))) ?? candidates[0];
-}
-
 /**
  * Why a web export cannot run right now, or null when it can.
  *
- * The export player is a build artefact rather than source, so a checkout that
- * has not run `npm run build:export` — or a server deployed without it — can
- * only find out by trying. Callers that hand the result straight to a browser
- * download need to know before they start writing bytes.
+ * The export player is a build artefact (src/main/exportPlayer.ts): a
+ * checkout builds its own on demand, but a server or app deployed without
+ * one can only find out by trying. Callers that hand the result straight to
+ * a browser download need to know before they start writing bytes.
  */
 export function webExportUnavailableReason(): string | null {
-  const playerJs = join(playerBundleDir(), 'player.js');
-  return existsSync(playerJs)
-    ? null
-    : `Export player bundle not found at ${playerJs}. Run: npm run build:export`;
+  return exportPlayerUnavailableReason();
 }
 
 export interface WebExportOptions {
@@ -55,6 +44,13 @@ export interface WebExportOptions {
    * rail number, which counts skipped ones.
    */
   dropSkipped?: boolean;
+  /**
+   * Copy only the media these slides (by id) show. Every slide stays in the
+   * page, so the player's slide numbers still match the deck's; the others
+   * simply have no files. For `slide-agent render`, which captures a few
+   * slides of a deck that may carry a gigabyte of media.
+   */
+  onlySlides?: ReadonlySet<string>;
   /** Re-encodes running at once. Two keeps libx264 busy without thrashing. */
   concurrency?: number;
 }
@@ -106,7 +102,7 @@ const PROFILES: Record<WebExportQuality, QualityProfile> = {
   },
 };
 
-const VIDEO_EXTENSIONS = new Set(['.mp4', '.m4v', '.mov', '.webm', '.mkv', '.avi', '.mpg', '.mpeg', '.wmv', '.ogv']);
+const VIDEO_EXTENSIONS = new Set(['.mp4', '.m4v', '.mov', '.qt', '.webm', '.mkv', '.avi', '.mpg', '.mpeg', '.wmv', '.ogv']);
 /** Stills worth re-encoding. GIF and SVG stay as they are: one animates, one has no pixels. */
 const IMAGE_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.webp', '.bmp', '.tif', '.tiff', '.heic', '.heif', '.avif']);
 
@@ -119,7 +115,7 @@ export async function exportDeck(
 ): Promise<WebExportResult> {
   const unavailable = webExportUnavailableReason();
   if (unavailable) throw new Error(unavailable);
-  const bundleDir = playerBundleDir();
+  const bundleDir = await exportPlayerDir();
   const playerJs = join(bundleDir, 'player.js');
   const quality = options.quality ?? 'original';
   const profile = PROFILES[quality];
@@ -127,7 +123,9 @@ export async function exportDeck(
   const exported: Deck = options.dropSkipped
     ? { ...deck, slides: deck.slides.filter((slide) => !slide.skipped) }
     : deck;
-  const wanted = referencedAssets(exported);
+  const wanted = referencedAssets(options.onlySlides
+    ? { ...exported, slides: exported.slides.filter((slide) => options.onlySlides!.has(slide.id)) }
+    : exported);
   // theme.css names files no slide does: a webfont's `@font-face`, a paper
   // texture. It ships as written, so those go across under their own names.
   const theme = await loadTheme(deckDir, deck.theme);
@@ -154,16 +152,25 @@ export async function exportDeck(
   await copyFileStreamed(playerJs, join(outDir, 'player.js'));
   doneWeight += fixedWeight;
 
+  // Code blocks highlight from a second script holding every grammar; a deck
+  // without code does not carry it (vite.export.config.ts).
+  const codeHighlightJs = join(bundleDir, 'code-highlight.js');
+  if (exported.slides.some((slide) => slide.elements.some((element) => element.type === 'code'))
+    && existsSync(codeHighlightJs)) {
+    report('Copying code-highlight.js');
+    await copyFileStreamed(codeHighlightJs, join(outDir, 'code-highlight.js'));
+  }
+
   // The player's structural CSS, then the deck's theme, in that order — the
   // theme must win, exactly as it does in the app.
   const playerCss = join(bundleDir, 'player.css');
   report('Writing player.css');
   const structural = existsSync(playerCss) ? await readFile(playerCss, 'utf8') : '';
-  await writeFile(join(outDir, 'player.css'), structural, 'utf8');
+  await writeFileNamed(join(outDir, 'player.css'), structural, 'utf8');
   doneWeight += fixedWeight;
 
   report(`Writing ${deck.theme}`);
-  await writeFile(join(outDir, 'theme.css'), theme, 'utf8');
+  await writeFileNamed(join(outDir, 'theme.css'), theme, 'utf8');
   doneWeight += fixedWeight;
 
   // The folder exists even when every reference turned out to be unusable, so
@@ -221,8 +228,8 @@ export async function exportDeck(
   const rewritten = renamed.size > 0 || trimmed.size > 0
     ? rewriteAssetReferences(exported, renamed, trimmed)
     : exported;
-  await writeFile(join(outDir, 'index.html'), indexHtml(rewritten), 'utf8');
-  await writeFile(
+  await writeFileNamed(join(outDir, 'index.html'), indexHtml(rewritten), 'utf8');
+  await writeFileNamed(
     join(outDir, 'export.json'),
     JSON.stringify({
       title: deck.title,

@@ -2,7 +2,7 @@ import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { saveDeck } from '../src/main/deckStore.js';
+import { loadDeck, saveDeck } from '../src/main/deckStore.js';
 import { startCollabServer, type RunningCollabServer } from '../src/server/collabServer.js';
 import { emptyDeck } from '../src/shared/deck.js';
 import {
@@ -145,8 +145,18 @@ describe.skipIf(!electronBinary)('browser presentation pair', () => {
     expect(opened.presentation).toMatch(/^\d\d:\d\d$/);
     expect(opened.wall).not.toBe('--:--');
 
-    // Next: the audience advances, and the Speaker View follows it.
+    // Notes typed in the browser Speaker View travel through the collaboration
+    // bridge and stay attached to the slide when the show advances.
+    await speaker.click('.speaker-notes', 'Speaker View notes');
+    await speaker.typeKeys('Talk through the result');
     await speaker.click('.speaker-next-button', 'Speaker View next');
+    await eventually(
+      async () => (await loadDeck(deckDir)).slides[1]?.notes,
+      'Speaker View note did not reach the server',
+      (notes) => notes === 'Talk through the result',
+    );
+
+    // Next: the audience advances, and the Speaker View follows it.
     await eventually(
       async () => audience!.evaluate<{ slide: string | null }>(AUDIENCE_PROBE),
       'the audience did not advance when the speaker pressed Next',
@@ -160,6 +170,40 @@ describe.skipIf(!electronBinary)('browser presentation pair', () => {
     // Last slide of the range: there is no next slide to preview.
     expect(advanced.position).toBe('Slide 3 / 4 · Build 1 / 1');
     expect(advanced.next).toBeNull();
+
+    // The overview stays on the speaker's screen and jumps the audience.
+    await speaker.click('.speaker-slides', 'open slide overview');
+    expect(await speaker.evaluate<boolean>(
+      `document.querySelector('.speaker-overview').getBoundingClientRect().right <= document.querySelector('.speaker-current').getBoundingClientRect().left`,
+    )).toBe(true);
+    expect(await speaker.evaluate<string[]>(
+      `[...document.querySelectorAll('.speaker-overview-slide')].map((button) => button.getAttribute('data-slide'))`,
+    )).toEqual(['1', '2']);
+    await eventually(
+      async () => speaker!.evaluate<string | null>(
+        `document.querySelector('.speaker-overview-slide[data-slide="1"] .preview .slide')?.textContent?.trim() ?? null`,
+      ),
+      'the overview did not paint its thumbnail',
+      (value) => value === 'BRAVO SLIDE',
+    );
+    await speaker.click('.speaker-overview-slide[data-slide="1"]', 'jump to slide 2');
+    await eventually(
+      async () => audience!.evaluate<{ slide: string | null }>(AUDIENCE_PROBE),
+      'the audience did not follow the overview selection',
+      (value) => value.slide === 'BRAVO SLIDE',
+    );
+    expect(await speaker.evaluate<boolean>(
+      `!document.querySelector('.speaker-overview').hidden`,
+    )).toBe(true);
+    await speaker.click('.speaker-grid', 'open all slides grid');
+    expect(await speaker.evaluate<boolean>(
+      `document.querySelector('.speaker-overview').getBoundingClientRect().width > document.querySelector('.speaker-current').getBoundingClientRect().width`,
+    )).toBe(true);
+    await speaker.click('.speaker-overview-close', 'return to slide rail');
+    expect(await speaker.evaluate<boolean>(
+      `document.querySelector('#speaker').classList.contains('overview-open')`,
+    )).toBe(true);
+    await speaker.click('.speaker-next-button', 'return to slide 3');
 
     // Blank: the audience blanks without the Speaker View going dark with it.
     await speaker.click('.speaker-blank', 'Speaker View blank');

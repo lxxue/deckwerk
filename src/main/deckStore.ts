@@ -4,7 +4,9 @@ import { cp, mkdir, readFile, readdir, rename, rm, stat, writeFile } from 'node:
 import { basename, dirname, extname, join, resolve, sep } from 'node:path';
 import { type Deck, emptyDeck, parseDeck } from '@shared/deck.js';
 import type { ImportedAsset } from '@shared/ipc.js';
-import { classifyMediaName, CONVERTED_IMAGE_EXTS, importedAssetName, originalAssetCandidates } from '@shared/media.js';
+import {
+  capAssetStem, classifyMediaName, CONVERTED_IMAGE_EXTS, importedAssetName, importedVideoExtension, originalAssetCandidates,
+} from '@shared/media.js';
 import { serializeSpeakerNotes, SPEAKER_NOTES_FILE } from '@shared/speakerNotes.js';
 import { HISTORY_FILES } from '@shared/editHistory.js';
 import { VERSIONS_DIR } from './deckVersions.js';
@@ -25,6 +27,8 @@ import { convertHeicToPng } from './heic.js';
 
 export const DECK_FILE = 'deck.json';
 export const ASSETS_DIR = 'assets';
+/** Beside a deck that mirrors a server deck: which one, and the last server state seen (remoteDecks.ts). */
+export const REMOTE_STATE_DIR = '.deckwerk-remote';
 
 /**
  * Extensions a save dialog can plausibly hand us for a *new deck folder*.
@@ -199,7 +203,10 @@ export async function createDeck(dir: string, title?: string): Promise<Deck> {
 /**
  * Copy a complete deck folder without overwriting an existing destination.
  * A collaboration server's edit log (history.jsonl) and versions (.versions/)
- * stay behind: they record the original's edits, not the copy's.
+ * stay behind: they record the original's edits, not the copy's. So does the
+ * link to a server deck (.deckwerk-remote/): a copy that kept it would be a
+ * second mirror, and every edit to a talk forked this way would land in the
+ * talk it was forked from.
  */
 export async function copyDeck(sourceDir: string, targetDir: string): Promise<Deck> {
   const source = resolve(sourceDir);
@@ -210,9 +217,9 @@ export async function copyDeck(sourceDir: string, targetDir: string): Promise<De
   }
   if (existsSync(target)) throw new Error(`A file or folder already exists at ${target}`);
 
-  const logs = new Set([...HISTORY_FILES, VERSIONS_DIR].map((name) => join(source, name)));
+  const stayBehind = new Set([...HISTORY_FILES, VERSIONS_DIR, REMOTE_STATE_DIR].map((name) => join(source, name)));
   await cp(source, target, {
-    recursive: true, force: false, errorOnExist: true, filter: (path) => !logs.has(resolve(path)),
+    recursive: true, force: false, errorOnExist: true, filter: (path) => !stayBehind.has(resolve(path)),
   });
   return loadDeck(target);
 }
@@ -255,7 +262,7 @@ export async function importAsset(
   await mkdir(assetsDir, { recursive: true });
 
   const hash = await hashFile(sourcePath);
-  const ext = extname(sourcePath).toLowerCase();
+  const ext = importedVideoExtension(extname(sourcePath).toLowerCase());
   const stem = sanitize(basename(sourcePath, extname(sourcePath)));
   const name = importedAssetName.original(stem, hash, ext);
   const dest = join(assetsDir, name);
@@ -470,8 +477,9 @@ export async function importWebPage(
   return { src: `${ASSETS_DIR}/web/${name}`, bytes: Buffer.byteLength(html, 'utf8') };
 }
 
+/** A file stem safe on every file system, and short enough to add suffixes to. */
 function sanitize(name: string): string {
-  return name.replace(/[^a-zA-Z0-9._-]+/g, '-').replace(/^-+|-+$/g, '') || 'asset';
+  return capAssetStem(name.replace(/[^a-zA-Z0-9._-]+/g, '-').replace(/^-+|-+$/g, '') || 'asset');
 }
 
 async function hashFile(path: string): Promise<string> {

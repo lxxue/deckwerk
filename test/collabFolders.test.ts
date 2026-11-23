@@ -308,11 +308,13 @@ describe('collab server folders', () => {
       await writeFile(join(rootDir, 'loose', 'deck.json'), JSON.stringify({
         ...JSON.parse(await readFile(join(rootDir, 'loose', 'deck.json'), 'utf8')), title: 'Imported title',
       }), 'utf8');
-      // The session picks up the outside edit before the rename arrives.
-      await peer.next('deck', (message) => message.deck.title === 'Imported title');
+      // The session picks up the outside edit before the rename arrives,
+      // merged in as a transaction of its own.
+      await peer.next('txn', (message) => message.byClientId === 'disk'
+        && message.ops.some((op) => op.op === 'updateDeck' && op.title === 'Imported title'));
       const renamed = await api('/api/decks/rename?deck=loose&name=loose', { method: 'POST' });
       expect(renamed.body).toEqual({ id: 'loose', title: 'loose' });
-      const txn = await peer.next('txn');
+      const txn = await peer.next('txn', (message) => message.byClientId !== 'disk');
       expect(txn.ops).toEqual([{ op: 'updateDeck', title: 'loose' }]);
       expect(peer.messages.some((message) => message.kind === 'deckMoved')).toBe(false);
       peer.socket.terminate();
@@ -331,6 +333,38 @@ describe('collab server folders', () => {
       expect((await api('/api/folders/rename?path=clients%2Fglobex&name=taken', { method: 'POST' })).status)
         .toBe(409);
       expect((await api('/api/folders/rename?path=loose&name=x', { method: 'POST' })).status).toBe(404);
+    });
+
+    it('renames a folder people have a presentation in open, and takes them along', async () => {
+      const editor = new Peer(server.port, 'clients/acme/pitch');
+      const watcher = new Peer(server.port, 'clients/acme/pitch');
+      await editor.next('welcome');
+      await watcher.next('welcome');
+      // Accepted but not yet written (saves are debounced): the rename has to
+      // land it in the renamed folder.
+      editor.socket.send(JSON.stringify({
+        kind: 'txn', txnId: 'txn-before-folder-rename', baseSeq: 0, label: 'Add slide',
+        ops: [{ op: 'insertSlides', afterSlideId: 's1', slides: [{ id: 's2', name: 'Two' }] }],
+      }));
+      await watcher.next('txn', (message) => message.txnId === 'txn-before-folder-rename');
+
+      const renamed = await api('/api/folders/rename?path=clients%2Facme&name=globex', { method: 'POST' });
+      expect(renamed).toEqual({ status: 200, body: { path: 'clients/globex' } });
+
+      for (const peer of [editor, watcher]) {
+        expect(await peer.next('deckMoved')).toEqual({ kind: 'deckMoved', deckId: 'clients/globex/pitch', title: 'clients/acme/pitch' });
+        expect((await peer.closed).code).toBe(COLLAB_CLOSE.moved);
+      }
+      const saved = JSON.parse(await readFile(join(rootDir, 'clients', 'globex', 'pitch', 'deck.json'), 'utf8'));
+      expect(saved.slides.map((slide: { id: string }) => slide.id)).toEqual(['s1', 's2']);
+      await new Promise((done) => setTimeout(done, 1200));
+      expect(existsSync(join(rootDir, 'clients', 'acme'))).toBe(false);
+
+      // A client reconnecting to the old id is sent on to the new one.
+      const late = new Peer(server.port, 'clients/acme/pitch');
+      expect(await late.next('deckMoved')).toMatchObject({ deckId: 'clients/globex/pitch' });
+      expect((await late.closed).code).toBe(COLLAB_CLOSE.moved);
+      expect(existsSync(join(rootDir, 'clients', 'acme'))).toBe(false);
     });
 
     it('deletes an empty folder and only an empty folder', async () => {

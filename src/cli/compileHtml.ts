@@ -15,9 +15,11 @@ import {
 } from '@shared/htmlMeasure.js';
 import { PLAYER_TYPE_CSS } from '@shared/playerTypeCss.js';
 import { slidesFromMeasured, slidesToHtml, type MeasuredSlide } from '@shared/htmlSlides.js';
+import { termBuildWarnings } from '@shared/equationTerms.js';
+import { mathWarnings } from '@shared/mathDelimiters.js';
 import { loadTheme } from '../main/deckStore.js';
 import { backgroundElectronBinary } from './backgroundElectron.js';
-import { electronFailure, headlessElectronArgs } from './electronDisplay.js';
+import { electronChildEnv, electronFailure, headlessElectronArgs } from './electronDisplay.js';
 
 /**
  * Compile authored HTML into deck slides with the editor closed.
@@ -39,7 +41,11 @@ export interface CompileRequest {
 
 export interface CompiledHtml {
   slides: Slide[];
-  /** Inline style the browser silently dropped; see `MeasuredSlide.warnings`. */
+  /**
+   * Inline style the browser silently dropped (see `MeasuredSlide.warnings`)
+   * maths a text element leaves unclosed (`mathWarnings`), and term builds
+   * with no terms to step through (`termBuildWarnings`).
+   */
   warnings: string[];
   /**
    * What the browser measured, before any of it met the deck. The layout
@@ -73,9 +79,11 @@ export async function compileHtmlToSlides(request: CompileRequest): Promise<Comp
       'utf8',
     );
     const [measured] = await runPages([pagePath], request.deck.canvas) as MeasuredSlide[][];
+    const slides = slidesFromMeasured(request.deck, measured);
     return {
-      slides: slidesFromMeasured(request.deck, measured),
-      warnings: measured.flatMap((slide) => slide.warnings ?? []),
+      slides,
+      warnings: [...measured.flatMap((slide) => slide.warnings ?? []), ...mathWarnings(slides, authored),
+        ...termBuildWarnings(slides)],
       measured,
       theme,
     };
@@ -405,7 +413,7 @@ async function runElectron(script: string, jobPath: string): Promise<string> {
   return new Promise((resolvePromise, reject) => {
     const child = spawn(binary, [script, jobPath, ...headlessElectronArgs()], {
       stdio: ['ignore', 'pipe', 'pipe'],
-      env: { ...process.env, ELECTRON_DISABLE_SECURITY_WARNINGS: '1' },
+      env: electronChildEnv(),
     });
     let out = '';
     let err = '';

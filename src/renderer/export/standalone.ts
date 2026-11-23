@@ -1,5 +1,5 @@
 import '../player/player.css';
-import { parseDeck } from '@shared/deck.js';
+import { parseDeckForPlayback } from '@shared/deck.js';
 import { bindPresentKeys } from '../player/keys.js';
 import { Player } from '../player/player.js';
 import { eventOnInteractiveWeb, slideLinkFromEvent } from '../player/links.js';
@@ -31,7 +31,18 @@ function boot(): void {
     return;
   }
 
-  const deck = parseDeck(window.__DECK__);
+  // What this player cannot read is left out, named in the console; a deck
+  // it cannot read at all says so on screen instead of going black.
+  let parsed: ReturnType<typeof parseDeckForPlayback>;
+  try {
+    parsed = parseDeckForPlayback(window.__DECK__);
+  } catch (error) {
+    root.textContent = `This deck cannot be shown: ${error instanceof Error ? error.message : String(error)}`;
+    root.style.cssText += ';color:#eee;font:16px/1.5 system-ui,sans-serif;padding:24px;white-space:pre-wrap';
+    throw error;
+  }
+  const { deck, dropped } = parsed;
+  for (const what of dropped) console.warn(`Left out what this player cannot read: ${what}`);
   const player = new Player({
     deck,
     container: root,
@@ -44,10 +55,12 @@ function boot(): void {
 
   // Deep-linking for humans and agents alike: index.html#7 opens slide 7.
   // With this, "render slide N" is one headless-chromium screenshot away —
-  // no app, no server.
+  // no app, no server. A link is a jump, never a transition: a capture that
+  // walks #6, #7, #8 in one page otherwise photographed slide 7's Morph from
+  // slide 6 in flight, with slide 6's objects still on it.
   const jumpToHash = () => {
     const n = Number.parseInt(location.hash.replace('#', ''), 10);
-    if (Number.isFinite(n) && n >= 1) player.goToSlide(n - 1);
+    if (Number.isFinite(n) && n >= 1) player.goTo({ slide: n - 1, step: 0 }, { morph: false });
   };
   window.addEventListener('hashchange', jumpToHash);
   jumpToHash();

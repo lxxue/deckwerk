@@ -7,7 +7,7 @@ import { TimelinePanel } from '../src/renderer/editor/timelinePanel.js';
 describe('Build panel interactions', () => {
   beforeEach(() => document.body.replaceChildren());
 
-  it('adds selected reveals and reorders them through the visible drag grip', () => {
+  it('adds selected reveals and reorders them by dragging their rows in the build order', () => {
     const deck = emptyDeck('Build');
     deck.slides[0].elements.push(
       { id: 'a', type: 'text', x: 0, y: 0, w: 100, h: 50, rot: 0, z: 1,
@@ -33,9 +33,13 @@ describe('Build panel interactions', () => {
     addAnimation();
     expect(store.slide?.timeline.map((entry) => entry.action.target)).toEqual(['a', 'b']);
 
-    const rows = host.querySelectorAll<HTMLElement>('.timeline-row');
+    // The build order lists one compact row per build; the row itself is the
+    // drag handle.
+    const rows = host.querySelectorAll<HTMLElement>('.build-overview-row');
+    expect(rows).toHaveLength(2);
     const first = rows[0];
-    const secondGrip = rows[1].querySelector<HTMLElement>('.build-drag-handle')!;
+    const secondGrip = rows[1];
+    expect(secondGrip.draggable).toBe(true);
     first.getBoundingClientRect = () => ({ top: 0, height: 90 } as DOMRect);
     const transfer = { setData() {}, effectAllowed: '', dropEffect: '' };
     const start = new Event('dragstart', { bubbles: true });
@@ -75,25 +79,133 @@ describe('Build panel interactions', () => {
     document.body.appendChild(host);
     new TimelinePanel(host, store);
 
-    const rows = [...host.querySelectorAll<HTMLElement>('.timeline-row')];
+    // The build order: one row per build, numbered as the canvas badges are.
+    const rows = [...host.querySelectorAll<HTMLElement>('.build-overview-row')];
     expect(rows).toHaveLength(2);
-    // No element dropdown: the card names its element instead.
+    // No element dropdown: the row names its element instead.
     expect(host.querySelector('select.build-target')).toBeNull();
     expect(rows.map((r) => r.querySelector('.build-num')?.textContent)).toEqual(['1', '2']);
     expect(rows[0].querySelector('.build-target-name')?.textContent).toContain('Alpha');
     expect(rows[1].querySelector('.build-target-name')?.textContent).toContain('Beta');
-    // The element is the card's headline; the trigger sits on the line below.
-    expect(rows[0].querySelector('.build-card-head .build-target-name')).toBeTruthy();
-    expect(rows[0].querySelector('.build-card-when select.build-trigger')).toBeTruthy();
+    // Nothing picked yet: the settings card waits for a build.
+    expect(host.querySelectorAll('.timeline-row')).toHaveLength(0);
+    // Picking a row selects its element and shows that build's card, bound to
+    // one element: the element is the card's headline, the trigger below it.
+    rows[1].click();
+    expect([...store.get().selection]).toEqual(['b']);
+    const cards = [...host.querySelectorAll<HTMLElement>('.timeline-row')];
+    expect(cards).toHaveLength(1);
+    expect(cards[0].dataset.entryId).toBe('t-2');
+    expect(cards[0].querySelector('.build-card-head .build-num')?.textContent).toBe('2');
+    expect(cards[0].querySelector('.build-card-head .build-target-name')?.textContent).toContain('Beta');
+    expect(cards[0].querySelector('.build-field select.build-trigger')).toBeTruthy();
+    expect(host.querySelector('.build-overview-row[data-entry-id="t-2"]')!.classList.contains('selected')).toBe(true);
     // Elements are named by their content or shape, not their raw type.
     const listNames = [...host.querySelectorAll('.build-element-row')]
       .map((r) => r.textContent);
     expect(listNames).toEqual(['Alpha', 'Beta', 'rectangle']);
-    // Clicking a list row selects that element in the store.
-    (host.querySelector('.build-element-row[data-element-id="b"]') as HTMLButtonElement).click();
-    expect([...store.get().selection]).toEqual(['b']);
-    // The redundant "Click N" step labels are gone.
-    const labels = [...host.querySelectorAll('.step-label')].map((l) => l.textContent);
-    expect(labels.some((t) => /^Click \d/.test(t ?? ''))).toBe(false);
+    // Clicking a list row selects that element in the store, and its build.
+    (host.querySelector('.build-element-row[data-element-id="a"]') as HTMLButtonElement).click();
+    expect([...store.get().selection]).toEqual(['a']);
+    expect(host.querySelector<HTMLElement>('.timeline-row')!.dataset.entryId).toBe('t-1');
+    // The order groups builds under the click that starts them: the second
+    // follows the first, so both sit under one click.
+    const labels = [...host.querySelectorAll('.build-overview-step')].map((l) => l.textContent);
+    expect(labels).toEqual(['On enter · everything visible', 'Click 1']);
+  });
+
+  it('picks several builds with Shift and Cmd/Ctrl and deletes them together', () => {
+    const deck = emptyDeck('Build');
+    for (const id of ['a', 'b', 'c', 'd']) {
+      deck.slides[0].elements.push({ id, type: 'text', x: 0, y: 0, w: 100, h: 50, rot: 0, z: 1,
+        opacity: 1, class: [], style: {}, html: id.toUpperCase(), align: 'left', valign: 'top' });
+    }
+    deck.slides[0].timeline.push(...['a', 'b', 'c', 'd'].map((target, i) => (
+      { id: `t-${i + 1}`, trigger: { on: 'click' as const, ref: null, delay: 0 },
+        action: { type: 'appear' as const, target, value: null } })));
+    const store = new EditorStore(deck, '/tmp/build');
+    const host = document.createElement('div');
+    document.body.appendChild(host);
+    new TimelinePanel(host, store);
+    const row = (id: string) => host.querySelector<HTMLElement>(`.build-overview-row[data-entry-id="${id}"]`)!;
+    const click = (id: string, keys: MouseEventInit = {}) =>
+      row(id).dispatchEvent(new MouseEvent('click', { bubbles: true, ...keys }));
+    const picked = () => [...host.querySelectorAll<HTMLElement>('.build-overview-row.selected')]
+      .map((r) => r.dataset.entryId);
+
+    // Shift picks the range from the last build clicked, and selects every
+    // object those builds animate.
+    click('t-1');
+    click('t-3', { shiftKey: true });
+    expect(picked()).toEqual(['t-1', 't-2', 't-3']);
+    expect([...store.get().selection].sort()).toEqual(['a', 'b', 'c']);
+    expect(host.querySelector('.timeline-row')).toBeNull();
+    expect(host.querySelector('.build-delete-picked')?.textContent).toBe('Delete 3 builds');
+
+    // Cmd/Ctrl drops one from the pick, and adds one.
+    click('t-2', { metaKey: true });
+    expect(picked()).toEqual(['t-1', 't-3']);
+    click('t-4', { ctrlKey: true });
+    expect(picked()).toEqual(['t-1', 't-3', 't-4']);
+
+    // Delete on a picked row removes those builds -- never the objects -- in
+    // one undo step, and focus moves on to the next build.
+    row('t-3').focus();
+    const del = new KeyboardEvent('keydown', { key: 'Delete', bubbles: true, cancelable: true });
+    let reachedWindow = false;
+    const onWindow = () => { reachedWindow = true; };
+    window.addEventListener('keydown', onWindow);
+    row('t-3').dispatchEvent(del);
+    window.removeEventListener('keydown', onWindow);
+    expect(reachedWindow).toBe(false);
+    expect(store.slide?.timeline.map((entry) => entry.id)).toEqual(['t-2']);
+    expect(store.slide?.elements.map((element) => element.id)).toEqual(['a', 'b', 'c', 'd']);
+    expect(store.get().selection.size).toBe(0);
+    expect(store.history()[0].label).toBe('Delete 3 builds');
+    expect((document.activeElement as HTMLElement).dataset.entryId).toBe('t-2');
+    store.undo();
+    expect(store.slide?.timeline.map((entry) => entry.id)).toEqual(['t-1', 't-2', 't-3', 't-4']);
+
+    // Cmd/Ctrl+A picks them all; the button deletes the pick.
+    click('t-2');
+    row('t-2').focus();
+    row('t-2').dispatchEvent(new KeyboardEvent('keydown', { key: 'a', metaKey: true, bubbles: true }));
+    expect(picked()).toEqual(['t-1', 't-2', 't-3', 't-4']);
+    host.querySelector<HTMLButtonElement>('.build-delete-picked')!.click();
+    expect(store.slide?.timeline).toEqual([]);
+
+    // A plain click ends a pick, and so does picking an object on the slide.
+    store.undo();
+    click('t-1');
+    click('t-2', { shiftKey: true });
+    expect(picked()).toEqual(['t-1', 't-2']);
+    click('t-4');
+    expect(picked()).toEqual(['t-4']);
+    click('t-3', { shiftKey: true });
+    expect(picked()).toEqual(['t-3', 't-4']);
+    store.select(['a']);
+    expect(picked()).toEqual(['t-1']);
+    expect(host.querySelector<HTMLElement>('.timeline-row')!.dataset.entryId).toBe('t-1');
+  });
+
+  it('writes an element\'s steps in the list as the canvas badge does', () => {
+    const deck = emptyDeck('Build');
+    deck.slides[0].elements.push(
+      { id: 'a', type: 'text', x: 0, y: 0, w: 100, h: 50, rot: 0, z: 1,
+        opacity: 1, class: [], style: {}, html: 'Alpha', align: 'left', valign: 'top' },
+      { id: 'b', type: 'text', x: 0, y: 60, w: 100, h: 50, rot: 0, z: 2,
+        opacity: 1, class: [], style: {}, html: 'Beta', align: 'left', valign: 'top' },
+    );
+    const step = (id: string, type: 'appear' | 'disappear', target: string) => (
+      { id, trigger: { on: 'click' as const, ref: null, delay: 0 }, action: { type, target, value: null } });
+    deck.slides[0].timeline.push(step('t-1', 'appear', 'a'), step('t-2', 'appear', 'b'), step('t-3', 'disappear', 'a'));
+    const host = document.createElement('div');
+    document.body.appendChild(host);
+    new TimelinePanel(host, new EditorStore(deck, '/tmp/build'));
+
+    const steps = (id: string) =>
+      host.querySelector<HTMLElement>(`.build-element-row[data-element-id="${id}"]`)!.dataset.steps;
+    expect(steps('a')).toBe('1,3');
+    expect(steps('b')).toBe('2');
   });
 });

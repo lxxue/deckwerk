@@ -3,8 +3,11 @@ import { openThreadCount } from '@shared/comments.js';
 import { commentHighlightsShown, setCommentHighlightsShown } from './comments.js';
 import { elementFollowsLayout, layoutGeometryFor, realignElementToLayout } from '@shared/layoutMasters.js';
 import { EditorCanvas } from './canvas.js';
+import { isLineFamily } from '@shared/lineFamily.js';
 import { ARRANGE_LABELS, arrangeSelection } from './arrange.js';
 import { setCircularMask } from '@shared/mediaMask.js';
+import { wipeCandidates, wipeOfPair } from '@shared/compare.js';
+import { arrangeWipe } from './compareEdits.js';
 import { classifyMediaName, isPendingSrc } from '@shared/media.js';
 import { mediaNaturalSize } from './mediaNatural.js';
 import { Inspector } from './inspector.js';
@@ -28,6 +31,7 @@ import {
   type TextFormat,
 } from './textFormatting.js';
 import { showPasteThemeDialog } from './pasteThemeDialog.js';
+import { createToolbarPicker } from './exportPicker.js';
 
 /**
  * Shell-independent wiring shared by the Electron editor and the browser
@@ -135,6 +139,7 @@ export function wireCanvasInspector(
   inspector.onApplyTextSelectionMarkerColor = (value) =>
     canvas.applyTextSelectionMarkerColor(value);
   inspector.textSelectionMarkerColor = () => canvas.textSelectionMarkerColor();
+  inspector.onShiftTextIndent = (direction) => canvas.shiftTextIndent(direction);
   inspector.tableSelection = () => canvas.tableSelectionInfo();
   inspector.tableBorderSettings = () => canvas.tableBorderSettings();
   inspector.onSetTableBorderColor = (color) =>
@@ -148,12 +153,17 @@ export function wireCanvasInspector(
     canvas.applyTableCellTextStyle(property, value);
   inspector.onInsertTableColumn = (after) => canvas.insertTableColumn(after);
   inspector.onDeleteTableColumn = () => canvas.deleteTableColumn();
+  inspector.onInsertTableRow = (after) => canvas.insertTableRow(after);
+  inspector.onDeleteTableRow = () => canvas.deleteTableRow();
   inspector.textComputedTypography = (elementId) => canvas.textComputedTypography(elementId);
   inspector.onToggleMask = (id) => canvas.toggleMaskMode(id);
   inspector.maskingElement = () => canvas.maskingElement();
+  inspector.onTogglePathEdit = (id) => canvas.togglePathEdit(id);
+  inspector.pathEditingElement = () => canvas.pathEditingElement();
   inspector.onSeekPreview = (id, t) => canvas.seekVideo(id, t);
   inspector.videoDuration = (id) => canvas.videoDuration(id);
   canvas.onMaskModeChange = () => inspector.render();
+  canvas.onPathEditChange = () => inspector.render();
   canvas.onTextEditModeChange = () => inspector.render();
   canvas.onTextFormatStateChange = () => inspector.render();
   canvas.onTableSelectionChange = () => inspector.render();
@@ -388,12 +398,15 @@ export function bindEditorKeys(deps: ShellDeps, clipboard: ClipboardActions): vo
       duplicateSelection(store);
       return;
     }
-    if (mod && ['b', 'i', 'u'].includes(e.key.toLowerCase())) {
+    // Strikethrough is Cmd/Ctrl+Shift+X (Google Docs and Slides), which has
+    // to be caught before Cmd/Ctrl+X cuts the box.
+    const strike = mod && e.shiftKey && !e.altKey && e.key.toLowerCase() === 'x';
+    if (strike || (mod && ['b', 'i', 'u'].includes(e.key.toLowerCase()))) {
       const texts = store.selectedElements()
         .filter((element): element is Extract<SlideElement, { type: 'text' }> => element.type === 'text');
       if (texts.length > 0) {
         e.preventDefault();
-        const format: TextFormat = e.key.toLowerCase() === 'b'
+        const format: TextFormat = strike ? 'strikethrough' : e.key.toLowerCase() === 'b'
           ? 'bold' : e.key.toLowerCase() === 'i' ? 'italic' : 'underline';
         const active = texts.every((element) => wholeTextFormatState(element, format));
         store.updateSelected((element) => {
@@ -481,6 +494,25 @@ export function bindEditorKeys(deps: ShellDeps, clipboard: ClipboardActions): vo
       case 'n':
         if (!mod) rail.addSlide();
         break;
+      // Figma's drawing keys: P takes up the pen, Shift+P the pencil.
+      case 'p':
+      case 'P':
+        if (!mod && !e.altKey) {
+          e.preventDefault();
+          if (e.shiftKey) canvas.startPencil();
+          else canvas.startPen();
+        }
+        break;
+      case 'Enter': {
+        // Return on a selected line, arrow, curve or path opens its points,
+        // as a double-click does; a focused control keeps its own Return.
+        const [only] = store.selectedElements();
+        if (mod || e.altKey || !only || store.get().selection.size !== 1 || !isLineFamily(only)) break;
+        if (t?.closest('button, a, [role="menuitem"], #rail')) break;
+        e.preventDefault();
+        canvas.togglePathEdit(only.id);
+        break;
+      }
     }
   });
 }
@@ -524,6 +556,16 @@ export function makeContextActions(
           }, { label: 'Reset to layout position' }),
         });
       }
+      // Two pictures selected, not yet a wipe: stack them into one.
+      const elements = store.slide?.elements ?? [];
+      const pair = wipeCandidates(elements, store.get().selection);
+      if (pair && pair.some((member) => member.id === el.id)
+        && !wipeOfPair(elements, pair.map((member) => member.id))) {
+        items.push('separator', {
+          label: 'Arrange as wipe',
+          action: () => arrangeWipe(store, [pair[0].id, pair[1].id]),
+        });
+      }
       if (el.type === 'image' || el.type === 'video') {
         items.push('separator', {
           label: canvas.maskingElement() === el.id ? 'Done editing mask' : 'Edit mask (crop)',
@@ -552,6 +594,12 @@ export function makeContextActions(
         if (openTrim) {
           items.push({ label: 'Edit w/ ffmpeg…', action: () => openTrim(el) });
         }
+      }
+      if (isLineFamily(el) && sel === 1) {
+        items.push('separator', {
+          label: canvas.pathEditingElement() === el.id ? 'Done editing points' : 'Edit points',
+          action: () => canvas.togglePathEdit(el.id),
+        });
       }
       if (el.type === 'web') {
         items.push({
@@ -617,6 +665,7 @@ export function barButton(label: string, onClick: () => void, variant = ''): HTM
 export function barIconButton(label: string, iconSvg: string, onClick: () => void): HTMLButtonElement {
   const b = document.createElement('button');
   b.className = 'bar-icon-button';
+  b.title = label;
   b.innerHTML = `${iconSvg}<span>${label}</span>`;
   b.addEventListener('click', onClick);
   return b;
@@ -625,3 +674,21 @@ export function barIconButton(label: string, iconSvg: string, onClick: () => voi
 export const TEXT_ICON =
   '<svg class="bar-icon" viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">' +
   '<path d="M3 3.5V2.5h10v1M8 2.5v11M6 13.5h4" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>';
+
+/**
+ * Text ▾ on the Insert bar: a text box, or a code block. Built on the
+ * toolbar picker, so it opens and reads exactly like Shape ▾ beside it. Both
+ * editors' toolbars use this one, so they cannot drift apart.
+ */
+export function createTextInsertPicker(insert: { textBox: () => void; codeBlock: () => void }): HTMLElement {
+  const trigger = document.createElement('button');
+  trigger.className = 'shape-menu-trigger text-insert-trigger';
+  trigger.innerHTML = `${TEXT_ICON}<span>Text</span>`
+    + '<svg class="shape-menu-chevron" viewBox="0 0 10 10" width="9" height="9" aria-hidden="true">'
+    + '<path d="M2 3.5l3 3 3-3" fill="none" stroke="currentColor" stroke-width="1.5" '
+    + 'stroke-linecap="round" stroke-linejoin="round"/></svg>';
+  return createToolbarPicker('Text', [
+    { label: 'Text box', action: insert.textBox },
+    { label: 'Code block', action: insert.codeBlock },
+  ], { trigger });
+}

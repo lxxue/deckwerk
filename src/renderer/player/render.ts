@@ -1,18 +1,23 @@
 import { curvedShadowClasses } from '@shared/shapeShadow.js';
-import { MIRRORED_TEXT_STYLE_PROPERTIES } from '@shared/deck.js';
+import { MIRRORED_TEXT_STYLE_PROPERTIES, videoSpeed } from '@shared/deck.js';
 import type { Deck, MediaEffect, Slide, SlideElement } from '@shared/deck.js';
 import { fitScale } from '@shared/geometry.js';
+import { elementTransform } from '@shared/flip.js';
 import { fitAutoTextElement } from '@shared/autoFit.js';
 import { isPendingSrc, pendingName, pendingToken } from '@shared/media.js';
 import { gateVideoLoad } from './mediaLoadGate.js';
+import { videoMemory } from './videoMemory.js';
 import { previewPosterProvider } from './previewPosterProvider.js';
 import { prepareSlideLinks } from './links.js';
 import { quadraticPath, shapeSvg } from '@shared/shapeSvg.js';
 import { isMediaBorderPaint, typedPropertyOwnsCss } from '@shared/nativeCss.js';
 import { applyTableColumnWidths } from '@shared/paragraphs.js';
 import { isEmbeddableWebSrc, webReadinessAction } from '@shared/webBridge.js';
+import { syncWipe } from './wipe.js';
+import { renderCodeBody } from './codeRender.js';
 import renderMathInElement from 'katex/contrib/auto-render';
 import 'katex/dist/katex.min.css';
+import { katexTermOptions } from '@shared/equationTerms.js';
 
 /**
  * deck.json -> DOM.
@@ -51,6 +56,32 @@ export interface RenderOptions {
    * `mediaPreload: 'metadata'`.
    */
   deferVideoSrc?: boolean;
+  /**
+   * Pictures whose bytes the host is still fetching itself (the browser
+   * presentation's blob cache, mediaBlobCache.ts): such an `<img>` is built
+   * with no `src`, the URL parked in `data-deferred-src`, and the host gives
+   * it one once the bytes are in. Assigning the URL and taking it away again
+   * is not the same: WebKit starts the request the moment `src` is set, even
+   * on an element not yet in the document, and the picture crossed the wire
+   * twice, once for the element and once for the cache.
+   */
+  deferImageSrc?: (url: string) => boolean;
+  /**
+   * Decode pictures off the main thread (`decoding="async"`): the slide shows
+   * at once and each picture when it is ready. Every editor surface that is
+   * built as the author moves around sets it -- the canvas when it changes
+   * slides, the rail's miniatures, the Morph previews of this slide and the
+   * next. Decoded where they were painted, the full-size photographs of one
+   * such slide held Safari's main thread for 400-750 ms
+   * (editingLatencyBrowser.test.ts).
+   */
+  decodeImagesAsync?: boolean;
+}
+
+/** Give a picture its source, or park it for the host (`deferImageSrc`). */
+function assignImageSrc(image: HTMLImageElement, url: string, opts: RenderOptions): void {
+  if (opts.deferImageSrc?.(url)) image.dataset.deferredSrc = url;
+  else image.src = url;
 }
 
 export { quadraticPath };
@@ -116,8 +147,41 @@ export function applyVideoPlaybackState(
   // player's runtime loops start -> end instead, so the flag stays off whenever
   // an in- or out-point is set.
   video.loop = el.loop && el.start <= 0 && el.end === null;
-  if (el.poster) video.poster = opts.resolveSrc(el.poster);
+  // The default rate too: a reload (a new source, a pooled clip) resets the
+  // rate to it, and the canvas preview should play at the stored speed.
+  const speed = videoSpeed(el);
+  video.defaultPlaybackRate = speed;
+  if (video.playbackRate !== speed) video.playbackRate = speed;
+  // An element waiting for its bytes in memory shows the server's still.
+  const poster = el.poster ? opts.resolveSrc(el.poster) : video.dataset.stillPoster;
+  if (poster) video.poster = poster;
   else video.removeAttribute('poster');
+}
+
+/**
+ * The network URL an element shows, whatever it reads right now: a `blob:`
+ * URL standing in for it (videoMemory.ts), nothing yet, or a source the load
+ * gate parked.
+ */
+export function videoNetworkSrc(video: HTMLVideoElement): string {
+  return video.dataset.networkSrc ?? video.getAttribute('src') ?? video.dataset.gateAbortedSrc ?? '';
+}
+
+/**
+ * Give an element that is only showing its still a source now, because
+ * somebody wants to play or scrub it: its bytes in memory if they are there,
+ * else the network. Returns whether the element has a source.
+ */
+export function startVideoSource(video: HTMLVideoElement): boolean {
+  if (video.hasAttribute('src')) return true;
+  const url = video.dataset.networkSrc;
+  if (!url) return false;
+  delete video.dataset.memoryPending;
+  delete video.dataset.streamPending;
+  const held = videoMemory()?.objectUrl(url);
+  video.preload = 'auto';
+  video.src = held ?? url;
+  return true;
 }
 
 /**
@@ -148,7 +212,8 @@ export function applyMediaFitStyles(
   // media patch (the editor's in-place path calls it unconditionally), so it
   // covers a changed box and in-point as well as a changed fit or crop.
   if (el.type === 'video' && tag.tagName.toLowerCase() === 'video') {
-    tag.dataset.mediaKey = videoPresentationKey(el, tag.getAttribute('src') ?? '');
+    tag.dataset.mediaKey = videoPresentationKey(el, videoNetworkSrc(tag as HTMLVideoElement));
+    tag.dataset.assetSrc = el.src;
     // The poster-frame stamp is part of that same identity: a recovery pass
     // reads it to re-seek an element whose frame was dropped, and a stale
     // in-point here would restore the frame the clip no longer starts at.
@@ -259,8 +324,8 @@ export function renderElement(
 }
 
 /**
- * Write the wrapper box -- geometry, opacity, rotation and the element's own
- * CSS -- onto a node.
+ * Write the wrapper box -- geometry, opacity, rotation, flips and the
+ * element's own CSS -- onto a node.
  *
  * Shared with the editor rather than private to `renderElement`, because the
  * editor patches existing nodes in place for non-structural changes instead of
@@ -294,7 +359,7 @@ export function applyElementBoxStyles(
   s.width = `${el.w}px`;
   s.height = `${el.h}px`;
   s.opacity = String(el.opacity);
-  s.transform = el.rot ? `rotate(${el.rot}deg)` : '';
+  s.transform = elementTransform(el);
   for (const [k, v] of Object.entries(el.style)) {
     if (typedPropertyOwnsCss(el, k)) {
       s.removeProperty(k);
@@ -523,6 +588,9 @@ export function syncMediaFrame(
     if (radius) mediaBody.style.borderRadius = radius;
     else mediaBody.style.removeProperty('border-radius');
   }
+  // A before/after wipe is part of the picture's framing too, so it rides
+  // the same shared path (wipe.ts).
+  syncWipe(node, el, mediaBody);
 }
 
 function renderVisualEffects(
@@ -701,6 +769,9 @@ function renderBody(el: SlideElement, opts: RenderOptions): HTMLElement | SVGEle
         ],
         throwOnError: false,
         strict: 'ignore',
+        // Equation terms (`\step{2}{…}`) render as classed spans that term
+        // builds and pulses address; nothing else KaTeX gates is trusted.
+        ...katexTermOptions(),
       });
       const walker = document.createTreeWalker(content, NodeFilter.SHOW_TEXT);
       while (walker.nextNode()) {
@@ -725,7 +796,8 @@ function renderBody(el: SlideElement, opts: RenderOptions): HTMLElement | SVGEle
         return pdf;
       }
       const img = document.createElement('img');
-      img.src = opts.resolveSrc(el.src);
+      if (opts.decodeImagesAsync) img.decoding = 'async';
+      assignImageSrc(img, opts.resolveSrc(el.src), opts);
       img.alt = el.alt;
       img.draggable = false;
 
@@ -794,6 +866,9 @@ function renderBody(el: SlideElement, opts: RenderOptions): HTMLElement | SVGEle
     case 'web':
       return renderWeb(el, opts);
 
+    case 'code':
+      return renderCodeBody(el);
+
     case 'unsupported': {
       // Visible on purpose: an import gap you can see and fix beats content
       // that vanished silently.
@@ -836,7 +911,7 @@ function renderWeb(
 
   if (preview && el.poster) {
     const poster = document.createElement('img');
-    poster.src = opts.resolveSrc(el.poster);
+    assignImageSrc(poster, opts.resolveSrc(el.poster), opts);
     poster.alt = el.title;
     poster.style.width = '100%';
     poster.style.height = '100%';
@@ -874,7 +949,7 @@ function renderWeb(
   // author wants clicks on the page to advance the deck instead.
   frame.style.pointerEvents = preview || !el.interactive ? 'none' : 'auto';
   box.appendChild(frame);
-  if (!preview) revealWhenReady(box, frame, el.poster ? opts.resolveSrc(el.poster) : null, el.title);
+  if (!preview) revealWhenReady(box, frame, el.poster ? opts.resolveSrc(el.poster) : null, el.title, opts);
   return box;
 }
 
@@ -915,6 +990,7 @@ function revealWhenReady(
   frame: HTMLIFrameElement,
   posterSrc: string | null,
   title: string,
+  opts: RenderOptions,
 ): void {
   box.style.position = 'relative';
   box.dataset.webReady = 'false';
@@ -923,7 +999,7 @@ function revealWhenReady(
   if (posterSrc) {
     poster = document.createElement('img');
     poster.className = 'web-poster';
-    poster.src = posterSrc;
+    assignImageSrc(poster, posterSrc, opts);
     poster.alt = title;
     poster.setAttribute('aria-hidden', 'true');
     poster.draggable = false;
@@ -1133,6 +1209,8 @@ function renderVideo(
   const video = document.createElement('video');
   video.playsInline = true;
   video.dataset.mediaKey = videoPresentationKey(el, opts.resolveSrc(el.src));
+  // Which deck file this is: its URL may name content rather than a path.
+  video.dataset.assetSrc = el.src;
   // Black only once decoding has failed (player.css): a black surface behind a
   // working video shows as a dark hairline at its scaled edges on light slides.
   video.addEventListener('error', () => video.classList.add('media-failed'));
@@ -1155,7 +1233,25 @@ function renderVideo(
   // Chromium has already put in NETWORK_NO_SOURCE, whose queued 'emptied'
   // the load gate would read as a freed slot.
   const deferSrc = preload === 'metadata' && opts.deferVideoSrc === true && previewPosterProvider() !== null;
-  if (deferSrc) {
+  // A browser whose media stack re-downloads a clip for every element reads
+  // it from memory instead (videoMemory.ts). Preview surfaces have stills.
+  const memory = preload === 'metadata' && opts.deferVideoSrc !== true ? videoMemory() : null;
+  const memoryMode = memory?.mode(src, el.src) ?? 'network';
+  if (memory && memoryMode !== 'network') {
+    video.dataset.networkSrc = src;
+    const still = memory.still(el.src, el.start > 0 ? el.start : 0);
+    if (still) video.dataset.stillPoster = still;
+    const held = memoryMode === 'memory' ? memory.objectUrl(src) : undefined;
+    if (held) {
+      video.preload = 'auto';
+      video.src = held;
+    } else if (memoryMode === 'memory') {
+      video.dataset.memoryPending = 'true';
+      memory.request(src);
+    } else {
+      video.dataset.streamPending = 'true';
+    }
+  } else if (deferSrc) {
     // No src, no fetch, no decoder: the still is cut elsewhere. Stashed where
     // the gate keeps an aborted source, so recovery and capture code that
     // already read that slot need no second path.
@@ -1165,7 +1261,7 @@ function renderVideo(
     video.src = src;
   }
   applyVideoPlaybackState(video, el, opts);
-  if (preload === 'metadata' && !deferSrc) {
+  if (preload === 'metadata' && !deferSrc && memoryMode === 'network') {
     // Preview surfaces mount many videos at once (one per rail thumbnail);
     // letting them all fetch together monopolises the origin's connections.
     // They start as 'none' — src set, nothing fetched — and the gate promotes

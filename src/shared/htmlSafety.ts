@@ -24,6 +24,9 @@ export function sanitizeAuthoredHtml(source: string): {
   };
 
   for (const node of document.querySelectorAll('script, object, embed, iframe')) {
+    // A section's timeline block is JSON in a script of a type no browser
+    // runs: data the compile reads, kept only in exactly that form.
+    if (isTimelineBlock(node)) continue;
     report.removedScripts += 1;
     node.remove();
   }
@@ -73,6 +76,32 @@ export function sanitizeAuthoredHtml(source: string): {
 
   const doctype = document.doctype ? '<!doctype html>\n' : '';
   return { html: doctype + document.documentElement.outerHTML, report };
+}
+
+/**
+ * The textual counterpart of `sanitizeAuthoredHtml`'s script removal, for
+ * the collab server, which has no DOM: every script goes except a timeline
+ * block in exactly its exported form. The export writes `<` inside the block
+ * as `\u003c`, so a block holding any `<` is refused — a browser also ends a
+ * script at `</script/` or `</script ` where this match does not, and
+ * whatever followed such an early close would otherwise survive inside it.
+ */
+export function stripScriptsKeepingTimeline(source: string): string {
+  const open = '<script type="application/deckwerk-timeline">';
+  return source.replace(/<script\b[^>]*>[\s\S]*?<\/script\s*>/gi, (script) => (
+    script.startsWith(open) && !script.slice(open.length, script.lastIndexOf('</')).includes('<') ? script : ''
+  ));
+}
+
+/**
+ * `<script type="application/deckwerk-timeline">` and nothing else on the
+ * tag: a section's timeline as JSON (`htmlSlides.ts`), which no browser
+ * executes.
+ */
+function isTimelineBlock(node: Element): boolean {
+  return node.tagName.toLowerCase() === 'script'
+    && node.attributes.length === 1
+    && node.getAttribute('type') === 'application/deckwerk-timeline';
 }
 
 /**
@@ -153,6 +182,9 @@ const TAG_FORMAT_STYLES: Record<string, Array<[string, string]>> = {
   I: [['font-style', 'italic']],
   EM: [['font-style', 'italic']],
   U: [['text-decoration-line', 'underline']],
+  S: [['text-decoration-line', 'line-through']],
+  STRIKE: [['text-decoration-line', 'line-through']],
+  DEL: [['text-decoration-line', 'line-through']],
   // A superscript is raised *and* shrunk. Keeping only the baseline shift
   // would paste a full-size character sitting above the line, which reads as
   // a layout bug rather than as a superscript.
@@ -202,6 +234,62 @@ export function stripLayoutDeclarations(
     if (node.tagName === 'SPAN' && node.attributes.length === 0) node.replaceWith(...node.childNodes);
   }
   return changed;
+}
+
+/**
+ * The list paint a browser's copy writes onto every list and item: their
+ * computed style, not anything the author chose.
+ *
+ * type.css draws markers itself and so gives every item `list-style-type:
+ * none`; Chromium and Safari copy that onto each `<li>`, and an item's own
+ * marker type is what type.css reads as a request for the browser's native
+ * markers -- here, none. A list copied from one box and pasted into another
+ * kept its structure and lost every bullet, and the List control could not
+ * bring them back (Nov 2026). Other sources (Google Docs, any web page)
+ * write the browser's default for the level (`disc`, `circle`, `square`,
+ * `decimal`), which would trade the deck's markers for native ones. Both go;
+ * a type that is neither (`lower-roman`, a `square` first level) is the
+ * source's own and stays. Position, image and counters are the item box's,
+ * as is the editor-only `--list-item-em` (editor.css).
+ */
+export function stripEchoedListStyles(root: ParentNode): boolean {
+  let changed = false;
+  const remove = (node: HTMLElement, property: string) => {
+    if (!node.style.getPropertyValue(property)) return;
+    node.style.removeProperty(property);
+    changed = true;
+  };
+  for (const node of [...root.querySelectorAll<HTMLElement>('[style]')]) {
+    if (!node.style) continue;
+    remove(node, '--list-item-em');
+    if (/^(?:UL|OL|LI)$/.test(node.tagName)) {
+      remove(node, 'list-style-position');
+      remove(node, 'list-style-image');
+    }
+    if (node.tagName === 'LI') {
+      remove(node, 'counter-increment');
+      remove(node, 'counter-reset');
+      remove(node, 'counter-set');
+      const type = node.style.getPropertyValue('list-style-type').trim();
+      if (type === 'none' || (type && type === defaultItemMarker(node))) {
+        remove(node, 'list-style-type');
+      }
+    }
+    if (!node.getAttribute('style')?.trim()) node.removeAttribute('style');
+  }
+  return changed;
+}
+
+/** The marker a browser gives an item of its list on its own. */
+function defaultItemMarker(item: HTMLElement): string | null {
+  const list = item.parentElement;
+  if (list?.tagName === 'OL') return 'decimal';
+  if (list?.tagName !== 'UL') return null;
+  let depth = 0;
+  for (let up = list.parentElement?.closest('ul, ol'); up; up = up.parentElement?.closest('ul, ol')) {
+    depth += 1;
+  }
+  return depth === 0 ? 'disc' : depth === 1 ? 'circle' : 'square';
 }
 
 /**
@@ -419,7 +507,7 @@ export function sanitizePastedTextHtml(html: string): string {
   // (<strong><span style="font-weight:400">…) that no toggle could clean up.
   // Convert the tag dialect to the span dialect on the way in.
   for (const node of [...root.querySelectorAll<HTMLElement>(
-    'b, strong, i, em, u, sup, sub',
+    'b, strong, i, em, u, s, strike, del, sup, sub',
   )].reverse()) {
     const declarations = TAG_FORMAT_STYLES[node.tagName]!;
     const span = document.createElement('span');
@@ -431,6 +519,22 @@ export function sanitizePastedTextHtml(html: string): string {
     }
     span.append(...node.childNodes);
     node.replaceWith(span);
+  }
+  // `<u><s>both</s></u>` paints both lines, but as two spans the inner one's
+  // `text-decoration-line` would win once the editor merges nested runs, and
+  // one line would be lost. A run carries every line painted around it.
+  for (const node of root.querySelectorAll<HTMLElement>('[style*="text-decoration-line"]')) {
+    const own = node.style.getPropertyValue('text-decoration-line');
+    if (!own || own === 'none') continue;
+    const lines = new Set(own.split(/\s+/));
+    for (let parent = node.parentElement; parent; parent = parent.parentElement) {
+      const painted = parent.style.getPropertyValue('text-decoration-line')
+        || parent.style.getPropertyValue('text-decoration');
+      for (const word of painted.split(/\s+/)) {
+        if (/^(?:underline|overline|line-through)$/.test(word)) lines.add(word);
+      }
+    }
+    node.style.setProperty('text-decoration-line', [...lines].join(' '));
   }
   // Word's pseudo-lists arrive as MsoListParagraph paragraphs whose "bullet"
   // is a literal glyph in the text. Strip the fake marker and the vendor
@@ -461,6 +565,7 @@ export function sanitizePastedTextHtml(html: string): string {
     if (!node.getAttribute('style')?.trim()) node.removeAttribute('style');
   }
   stripLayoutDeclarations(root);
+  stripEchoedListStyles(root);
   stripRunBackgrounds(root);
   for (const node of root.querySelectorAll<HTMLElement>('*')) {
     for (const attribute of [...node.attributes]) {

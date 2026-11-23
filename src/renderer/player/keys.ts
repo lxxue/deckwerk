@@ -1,4 +1,5 @@
 import type { Player } from './player.js';
+import { videoRateChangeForKey, type VideoRateChange } from './videoRate.js';
 
 /**
  * The presenting key map, shared by the present window and the export bundle so
@@ -10,6 +11,10 @@ export interface KeyHandlers {
   onNext?: () => void;
   onPrev?: () => void;
   onHome?: () => void;
+  /** Blank toggled from the keyboard, for a shell that reports it elsewhere. */
+  onBlank?: () => void;
+  /** Video speed changed from the keyboard, for a shell that relays it elsewhere. */
+  onVideoRate?: (change: VideoRateChange) => void;
 }
 
 export function bindPresentKeys(
@@ -22,6 +27,14 @@ export function bindPresentKeys(
     // Never steal keys from a focused field; the editor preview shares this map.
     const t = e.target as HTMLElement | null;
     if (t && (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName))) {
+      return;
+    }
+
+    const rateChange = videoRateChangeForKey(e.key);
+    if (rateChange) {
+      e.preventDefault();
+      if (handlers.onVideoRate) handlers.onVideoRate(rateChange);
+      else player.changeVideoRate(rateChange);
       return;
     }
 
@@ -51,7 +64,8 @@ export function bindPresentKeys(
       case 'b':
       case 'B':
         e.preventDefault();
-        player.toggleBlank();
+        if (handlers.onBlank) handlers.onBlank();
+        else player.toggleBlank();
         break;
       case 'Escape':
         e.preventDefault();

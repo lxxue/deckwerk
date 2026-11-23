@@ -22,6 +22,41 @@ const LIST_TAGS = new Set(['UL', 'OL']);
 export const TYPING_STYLE_SENTINEL = '\u2060';
 export const LIST_MARKER_COLOR_ATTRIBUTE = 'data-list-marker-color';
 export const LIST_MARKER_COLOR_PROPERTY = '--list-marker-color';
+/**
+ * Marks an item that only holds an indented list: the first item of a list,
+ * indented, has no item to hang under, so it hangs in one of its own. That
+ * item is not a line of the text -- type.css gives it no marker and no
+ * number -- and it goes when it holds no list any more.
+ */
+export const LIST_HOLDER_ATTRIBUTE = 'data-list-holder';
+
+/**
+ * How many steps a paragraph outside a list is indented, each one the width
+ * a nested list level steps in (type.css). List items indent by nesting, so
+ * the attribute means nothing on an item.
+ */
+export const PARAGRAPH_INDENT_ATTRIBUTE = 'data-indent';
+export const MAX_PARAGRAPH_INDENT = 8;
+
+/** A paragraph's indent level, 0 when it has none. */
+export function paragraphIndent(block: Element): number {
+  const level = Number.parseInt(block.getAttribute(PARAGRAPH_INDENT_ATTRIBUTE) ?? '', 10);
+  return Number.isFinite(level) ? Math.max(0, Math.min(MAX_PARAGRAPH_INDENT, level)) : 0;
+}
+
+/** Give a paragraph an indent level, clamped; reports whether it changed. */
+export function setParagraphIndent(block: Element, level: number): boolean {
+  const next = Math.max(0, Math.min(MAX_PARAGRAPH_INDENT, Math.round(level)));
+  const written = block.getAttribute(PARAGRAPH_INDENT_ATTRIBUTE);
+  if (next === 0) {
+    if (written === null) return false;
+    block.removeAttribute(PARAGRAPH_INDENT_ATTRIBUTE);
+    return true;
+  }
+  if (written === String(next)) return false;
+  block.setAttribute(PARAGRAPH_INDENT_ATTRIBUTE, String(next));
+  return true;
+}
 /** Inline wrappers that only format their text. */
 const INLINE_FORMAT_TAGS = new Set([
   'SPAN', 'FONT', 'B', 'STRONG', 'I', 'EM', 'U', 'S', 'STRIKE', 'DEL', 'INS',
@@ -179,7 +214,11 @@ export function paragraphsToList(html: string, ordered = false): string {
       const match = marker.exec(block.textContent ?? '');
       if (match) removeLeadingText(block, match[0].length);
       const li = document.createElement('li');
-      for (const attr of [...block.attributes]) li.setAttribute(attr.name, attr.value);
+      for (const attr of [...block.attributes]) {
+        // An item is indented by nesting, never by the paragraph's attribute.
+        if (attr.name !== PARAGRAPH_INDENT_ATTRIBUTE) li.setAttribute(attr.name, attr.value);
+      }
+      clearItemMarkerOverride(li);
       while (block.firstChild) li.appendChild(block.firstChild);
       list.appendChild(li);
       block.remove();
@@ -278,23 +317,66 @@ export function changeListType(html: string, ordered: boolean): string {
   const template = document.createElement('template');
   template.innerHTML = html;
   const from = ordered ? 'UL' : 'OL';
-  const to = ordered ? 'ol' : 'ul';
   let changed = false;
   for (const list of [...template.content.children]) {
     if (list.tagName !== from) continue;
-    const replacement = document.createElement(to);
-    for (const attr of [...list.attributes]) {
-      if (!ordered && attr.name === 'start') continue;
-      replacement.setAttribute(attr.name, attr.value);
+    // Its sub-lists are part of the list being converted, as on the canvas.
+    const converted = retagList(list as HTMLElement, ordered);
+    for (const nested of [...converted.querySelectorAll<HTMLElement>('ul, ol')]) {
+      retagList(nested, ordered);
     }
-    while (list.firstChild) replacement.appendChild(list.firstChild);
-    list.replaceWith(replacement);
+    clearListMarkerOverrides(converted);
     changed = true;
   }
   if (!changed) return ordered ? paragraphsToOrderedList(html) : paragraphsToList(html);
   const out = document.createElement('div');
   out.append(template.content.cloneNode(true));
   return out.innerHTML;
+}
+
+/**
+ * `list` as a numbered (`ordered`) or bulleted list, in place. A list that
+ * changes kind loses the marker type it was given: a numbering style on a
+ * list that is now bulleted (an imported `lower-alpha`) would otherwise keep
+ * drawing letters.
+ */
+export function retagList(list: HTMLElement, ordered: boolean): HTMLElement {
+  const tag = ordered ? 'OL' : 'UL';
+  if (list.tagName === tag) return list;
+  const replacement = (list.ownerDocument ?? document).createElement(tag.toLowerCase());
+  for (const attr of [...list.attributes]) {
+    if (!ordered && attr.name === 'start') continue;
+    replacement.setAttribute(attr.name, attr.value);
+  }
+  replacement.style.removeProperty('list-style-type');
+  if (!replacement.getAttribute('style')?.trim()) replacement.removeAttribute('style');
+  while (list.firstChild) replacement.appendChild(list.firstChild);
+  list.replaceWith(replacement);
+  return replacement;
+}
+
+/**
+ * Drop a marker type written on one list item. An item never carries one the
+ * author chose -- no control writes it, and importers put a numbering style
+ * on the list -- but a browser's copy writes every item's computed style onto
+ * it, and the `none` type.css gives items (it draws their markers itself) then
+ * pastes back as a request for no marker at all: a pasted list showed no
+ * bullets, and no list control could bring them back.
+ */
+export function clearItemMarkerOverride(item: HTMLElement): boolean {
+  if (!item.style?.getPropertyValue('list-style-type')) return false;
+  item.style.removeProperty('list-style-type');
+  if (!item.getAttribute('style')?.trim()) item.removeAttribute('style');
+  return true;
+}
+
+/** `clearItemMarkerOverride` for every item of `list` and of its sub-lists. */
+export function clearListMarkerOverrides(list: HTMLElement): boolean {
+  let changed = false;
+  for (const item of list.querySelectorAll<HTMLElement>('li')) {
+    if (clearItemMarkerOverride(item)) changed = true;
+  }
+  return changed;
 }
 
 /** Delete a text prefix while retaining the inline formatting after it. */
@@ -481,6 +563,103 @@ export function pastedTableHtml(html: string, plainText = ''): string | null {
   return pastedTableData(html, plainText)?.html ?? null;
 }
 
+/** A paragraph carrying an item's own attributes, minus list-only paint. */
+function paragraphFrom(source: HTMLElement): HTMLElement {
+  const doc = source.ownerDocument ?? document;
+  const paragraph = doc.createElement('p');
+  for (const attr of [...source.attributes]) {
+    if (attr.name !== LIST_MARKER_COLOR_ATTRIBUTE) paragraph.setAttribute(attr.name, attr.value);
+  }
+  paragraph.style.removeProperty(LIST_MARKER_COLOR_PROPERTY);
+  paragraph.style.removeProperty('list-style-type');
+  if (!paragraph.getAttribute('style')?.trim()) paragraph.removeAttribute('style');
+  return paragraph;
+}
+
+/**
+ * Every paragraph one list item's content becomes, in document order.
+ *
+ * A sub-list or a block written inside the item (Google Docs and Word both do
+ * this) becomes its own paragraph exactly where it was, rather than being
+ * appended after the item it was nested in. An empty item stays one empty
+ * paragraph — that is the case the caret lands in most often.
+ */
+export function listItemParagraphs(item: HTMLElement): HTMLElement[] {
+  const doc = item.ownerDocument ?? document;
+  const out: HTMLElement[] = [];
+  let current = paragraphFrom(item);
+  const flush = () => {
+    if (current.childNodes.length > 0) out.push(current);
+    current = paragraphFrom(item);
+  };
+  for (const node of [...item.childNodes]) {
+    if (node instanceof HTMLElement && LIST_TAGS.has(node.tagName)) {
+      flush();
+      for (const nested of [...node.children] as HTMLElement[]) {
+        if (nested.tagName === 'LI') out.push(...listItemParagraphs(nested));
+      }
+      continue;
+    }
+    if (node instanceof HTMLElement && node.tagName === 'LI') {
+      // Chromium's Return inside an item that holds a sub-list can leave an
+      // item nested straight inside an item. It is a paragraph of its own,
+      // exactly like a sub-list's items — never a paragraph's content.
+      flush();
+      out.push(...listItemParagraphs(node));
+      continue;
+    }
+    if (node instanceof HTMLElement && /^(?:P|DIV|H[1-6])$/.test(node.tagName)) {
+      flush();
+      const paragraph = paragraphFrom(node);
+      while (node.firstChild) paragraph.appendChild(node.firstChild);
+      out.push(paragraph);
+      continue;
+    }
+    current.appendChild(node);
+  }
+  flush();
+  if (out.length === 0) {
+    const empty = paragraphFrom(item);
+    empty.appendChild(doc.createElement('br'));
+    out.push(empty);
+  }
+  return out;
+}
+
+/**
+ * Turn one whole list into plain paragraphs, in place.
+ *
+ * Sub-lists, blocks written inside an item, and the malformed shapes
+ * contenteditable leaves behind all become paragraphs exactly where they
+ * stood, so nothing is reordered and nothing is dropped.
+ */
+export function flattenListToParagraphs(list: HTMLElement): HTMLElement[] {
+  const doc = list.ownerDocument ?? document;
+  const fragment = doc.createDocumentFragment();
+  const paragraphs: HTMLElement[] = [];
+  const take = (item: HTMLElement) => {
+    for (const paragraph of listItemParagraphs(item)) {
+      fragment.appendChild(paragraph);
+      paragraphs.push(paragraph);
+    }
+  };
+  for (const child of [...list.children] as HTMLElement[]) {
+    if (child.tagName === 'LI') {
+      take(child);
+      continue;
+    }
+    // A sub-list Chromium wrote as a sibling of the items rather than inside
+    // one of them. Its items are paragraphs too, where they stand.
+    if (LIST_TAGS.has(child.tagName)) {
+      for (const nested of [...child.children] as HTMLElement[]) {
+        if (nested.tagName === 'LI') take(nested);
+      }
+    }
+  }
+  list.replaceWith(fragment);
+  return paragraphs;
+}
+
 /**
  * Convert a bulleted list back to paragraph markup, one paragraph per item.
  * Normalisation keeps the single-paragraph case as bare inline markup.
@@ -491,19 +670,11 @@ export function listToParagraphs(html: string): string {
   let changed = false;
   for (const list of [...template.content.children]) {
     if (!LIST_TAGS.has(list.tagName)) continue;
-    const fragment = document.createDocumentFragment();
-    for (const item of [...list.children]) {
-      if (item.tagName !== 'LI') continue;
-      const p = document.createElement('p');
-      for (const attr of [...item.attributes]) {
-        if (attr.name !== LIST_MARKER_COLOR_ATTRIBUTE) p.setAttribute(attr.name, attr.value);
-      }
-      p.style.removeProperty(LIST_MARKER_COLOR_PROPERTY);
-      if (!p.getAttribute('style')?.trim()) p.removeAttribute('style');
-      p.innerHTML = item.innerHTML;
-      fragment.appendChild(p);
-    }
-    list.replaceWith(fragment);
+    // Each item's sub-lists become paragraphs of their own where they stood.
+    // Copying an item's markup into one paragraph nested a list in a `<p>`,
+    // which no parser keeps: the box showed the sub-items as a list still,
+    // and saved a shape no list control could reach (Nov 2026).
+    flattenListToParagraphs(list as HTMLElement);
     changed = true;
   }
   if (!changed) return html;
@@ -682,10 +853,37 @@ function nestStrayLists(root: ParentNode & Node): void {
     if (prev?.tagName === 'LI') {
       prev.appendChild(list);
     } else {
-      // No item to attach to (indented the first bullet): give it one.
+      // No item to attach to (indented the first bullet): give it one, which
+      // is not a line of its own. An ordinary item here drew an empty bullet
+      // above the indented one the moment editing ended.
       const li = (root.ownerDocument ?? document).createElement('li');
+      li.setAttribute(LIST_HOLDER_ATTRIBUTE, '');
       list.parentNode?.insertBefore(li, list);
       li.appendChild(list);
+    }
+  }
+}
+
+/**
+ * A holder item (`LIST_HOLDER_ATTRIBUTE`) holds blocks -- the indented list,
+ * and the paragraph an item of it becomes when its bullet is taken off --
+ * and never a line of its own. Words directly in it (a paste can put them
+ * there) are such a line, and make it an ordinary item; holding no block any
+ * more, it is nothing at all and goes, with its list if that leaves the list
+ * empty. Either way the box looks as it did while it was being edited.
+ */
+function settleListHolders(root: ParentNode & Node): void {
+  for (const holder of [...root.querySelectorAll<HTMLElement>(`li[${LIST_HOLDER_ATTRIBUTE}]`)]) {
+    const inline = [...holder.childNodes]
+      .filter((node) => !(node instanceof Element && BLOCK_TAGS.has(node.tagName)));
+    if (hasContent(inline)) {
+      holder.removeAttribute(LIST_HOLDER_ATTRIBUTE);
+    } else if (inline.length < holder.childNodes.length) {
+      for (const node of inline) node.remove();
+    } else {
+      const list = holder.parentElement;
+      holder.remove();
+      if (list && LIST_TAGS.has(list.tagName) && list.children.length === 0) list.remove();
     }
   }
 }
@@ -837,8 +1035,15 @@ export function stripStructuralWhitespace(root: ParentNode & Node): void {
   }
 }
 
-/** Contenteditable can split one list into adjacent sibling lists on Return. */
-function mergeAdjacentLists(root: ParentNode & Node): void {
+/**
+ * Contenteditable can split one list into adjacent sibling lists on Return,
+ * and a deleted line between two lists leaves them side by side. Either way
+ * they are one list: numbered, the second's own `start` no longer applies.
+ * The editor runs this on the live box too, so the numbers an author sees
+ * while editing are the ones the deck stores. Returns whether it joined any.
+ */
+export function mergeAdjacentLists(root: ParentNode & Node): boolean {
+  let joined = false;
   let current = root.firstElementChild;
   while (current) {
     // Directly adjacent: a bare run of text between two lists is a paragraph
@@ -848,10 +1053,12 @@ function mergeAdjacentLists(root: ParentNode & Node): void {
     if (next && LIST_TAGS.has(current.tagName) && next.tagName === current.tagName) {
       while (next.firstChild) current.appendChild(next.firstChild);
       next.remove();
+      joined = true;
       continue;
     }
     current = current.nextElementSibling;
   }
+  return joined;
 }
 
 /**
@@ -871,6 +1078,7 @@ export function normalizeParagraphHtml(html: string, splitBreaks = false): strin
   adoptOrphanListItems(template.content);
   nestStrayLists(template.content);
   adoptStrayListContent(template.content);
+  settleListHolders(template.content);
   mergeAdjacentLists(template.content);
   hoistBlocksOutOfInlines(template.content);
   // Nesting a stray list into the item before it puts that item's trailing

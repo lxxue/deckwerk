@@ -22,6 +22,7 @@ import {
 } from '@shared/clipboard.js';
 import { effectiveThemeStyle } from '@shared/themes.js';
 import { makeId } from '@shared/geometry.js';
+import { codeLines } from '@shared/codeBlocks.js';
 import { pastedTableData } from '@shared/paragraphs.js';
 import { classifyMediaName } from '@shared/media.js';
 import type {
@@ -105,6 +106,34 @@ export class EditorStore {
   /** Signals that the independently persisted history needs a later flush. */
   onHistoryChange: (() => void) | null = null;
 
+  /**
+   * Why the deck may not be edited right now, or null. While set, every
+   * local edit (commit, drag, history replace or restore) is refused and
+   * reported through `onEditRefused`; renderer measurements and remote decks
+   * still land. The collab shell sets it while it shows the copy of a deck
+   * kept in the browser, opened without the server: anything edited there
+   * would be discarded when the server answers.
+   */
+  private editLock: string | null = null;
+  onEditRefused: ((reason: string) => void) | null = null;
+
+  setEditLock(reason: string | null): void {
+    this.editLock = reason;
+  }
+
+  get editLocked(): string | null {
+    return this.editLock;
+  }
+
+  /** True (and reported) when the edit about to happen must not. */
+  private refuseEdit(): boolean {
+    if (this.editLock === null) return false;
+    this.onEditRefused?.(this.editLock);
+    // Views that drew the attempt (a dragged box, typed text) draw the deck again.
+    this.emit();
+    return true;
+  }
+
   private state: EditorState;
   private listeners = new Set<Listener>();
   private historyListeners = new Set<() => void>();
@@ -146,6 +175,13 @@ export class EditorStore {
   /** The same memo for deck properties: the last incoming set and its parse. */
   private remoteProps: { from: Omit<Deck, 'slides'>; to: Omit<Deck, 'slides'> } | null = null;
   private remoteDepth = 0;
+  /**
+   * Lines picked in a code block's gutter, for a build on just those lines.
+   * Not part of EditorState: it is a sub-selection of the one selected
+   * block, read through `codeLineSelection()`, which drops it the moment that
+   * block is no longer the selection.
+   */
+  private pickedCodeLines: { elementId: string; anchor: number; from: number; to: number } | null = null;
 
   constructor(deck: Deck, dir: string | null = null) {
     this.state = {
@@ -273,6 +309,7 @@ export class EditorStore {
 
   /** Replace the document as one local, dirty, undoable transaction. */
   replaceWithHistory(deck: Deck, label: string): void {
+    if (this.refuseEdit()) return;
     const anchor = this.cursorAnchor();
     const previous = this.state.deck;
     this.state = { ...this.state, deck: parseDeck(deck), dirty: true };
@@ -484,6 +521,8 @@ export class EditorStore {
       return;
     }
 
+    if (this.refuseEdit()) return;
+
     // Transient commits stream work in progress (live typing) to collaborators
     // without consuming undo slots or history entries; the coalesce key lets
     // the collab undo layer fold the stream into one undoable edit.
@@ -530,6 +569,12 @@ export class EditorStore {
     if (!this.txnBase) return;
     const base = this.txnBase;
     this.txnBase = null;
+    // A gesture begun before the lock: put back what it moved.
+    if (this.editLock !== null && base !== this.state.deck) {
+      this.state = { ...this.state, deck: base };
+      this.refuseEdit();
+      return;
+    }
     // A drag that ended where it started shouldn't consume an undo slot.
     if (base !== this.state.deck) {
       const forward = diffDecks(base, this.state.deck);
@@ -617,6 +662,7 @@ export class EditorStore {
   }
 
   restoreHistory(id: number): boolean {
+    if (this.refuseEdit()) return false;
     const historyIndex = this.historyLog.findIndex((item) => item.id === id);
     const snapshot = this.historyLog[historyIndex];
     const materialized = this.materializeHistoryIndex(historyIndex);
@@ -768,6 +814,8 @@ export class EditorStore {
   }
 
   select(ids: string[], additive = false): void {
+    // A gutter pick belongs to the selection it was made in.
+    this.pickedCodeLines = null;
     const selection = additive ? new Set(this.state.selection) : new Set<string>();
     for (const id of ids) {
       if (additive && selection.has(id)) selection.delete(id);
@@ -780,6 +828,51 @@ export class EditorStore {
       slideSelection: new Set(currentSlide ? [currentSlide.id] : []),
       selection,
     };
+    this.emit();
+  }
+
+  /**
+   * The code lines picked in the selected block's gutter, or null. Only ever
+   * answers for a code block that is the whole selection, clamped to the
+   * lines it has now.
+   */
+  codeLineSelection(): { elementId: string; from: number; to: number } | null {
+    const picked = this.pickedCodeLines;
+    if (!picked) return null;
+    const { selection } = this.state;
+    if (selection.size !== 1 || !selection.has(picked.elementId)) return null;
+    const element = this.slide?.elements.find((candidate) => candidate.id === picked.elementId);
+    if (element?.type !== 'code') return null;
+    const count = codeLines(element.code).length;
+    const from = Math.min(picked.from, count);
+    const to = Math.min(picked.to, count);
+    return from >= 1 ? { elementId: picked.elementId, from, to } : null;
+  }
+
+  /**
+   * Pick a line in a code block's gutter; `extend` (Shift) stretches the pick
+   * from the line picked before to this one. Selects the block if needed.
+   */
+  selectCodeLines(elementId: string, line: number, extend = false): void {
+    const previous = this.codeLineSelection();
+    const anchor = extend && previous?.elementId === elementId ? this.pickedCodeLines!.anchor : line;
+    // select() drops any earlier pick, so it goes first.
+    if (this.state.selection.size !== 1 || !this.state.selection.has(elementId)) this.select([elementId]);
+    this.pickedCodeLines = { elementId, anchor, from: Math.min(anchor, line), to: Math.max(anchor, line) };
+    this.emit();
+  }
+
+  /** Pick a whole range of a block's lines at once (a build's lines, shown on the slide). */
+  setCodeLineRange(elementId: string, from: number, to: number): void {
+    if (this.state.selection.size !== 1 || !this.state.selection.has(elementId)) this.select([elementId]);
+    this.pickedCodeLines = { elementId, anchor: Math.min(from, to), from: Math.min(from, to), to: Math.max(from, to) };
+    this.emit();
+  }
+
+  /** Forget a gutter pick, e.g. on a click in the code rather than its gutter. */
+  clearCodeLines(): void {
+    if (!this.pickedCodeLines) return;
+    this.pickedCodeLines = null;
     this.emit();
   }
 
@@ -1028,6 +1121,26 @@ export function sameSlideDrawing(left: Slide, right: Slide): boolean {
   if (left.elements.length !== right.elements.length) return false;
   return left.elements.every((element, i) =>
     element === right.elements[i] || jsonEqual(element, right.elements[i], ['comments']));
+}
+
+/**
+ * The objects of `right` that draw differently from `left`, when that is the
+ * only way the two slides' pictures differ: the slide itself, the set of
+ * objects and their paint order all agree. `null` when anything else changed.
+ * A view that paints the slide can then redraw just those objects.
+ */
+export function changedSlideObjects(left: Slide, right: Slide): Slide['elements'] | null {
+  if (!jsonEqual(left, right, ['notes', 'comments', 'elements'])) return null;
+  if (left.elements.length !== right.elements.length) return null;
+  const changed: Slide['elements'] = [];
+  for (let i = 0; i < left.elements.length; i++) {
+    const before = left.elements[i];
+    const after = right.elements[i];
+    if (before === after) continue;
+    if (before.id !== after.id || before.z !== after.z) return null;
+    if (!jsonEqual(before, after, ['comments'])) changed.push(after);
+  }
+  return changed;
 }
 
 /** Whether two decks differ in nothing but their slides' speaker notes and comments. */

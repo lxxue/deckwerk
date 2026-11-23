@@ -4,8 +4,10 @@ import { resolveState } from '@shared/timeline.js';
 import { revealImagesWhenDecoded } from '../player/imageDecode.js';
 import { freezePreviewVideos, releasePreviewVideos } from '../player/previewPoster.js';
 import { applyStageScale, renderSlide, rewriteCssAssetUrls } from '../player/render.js';
+import { prepareCodeBlocks } from '../player/codeRender.js';
 import { applyStaticSlideState } from '../player/staticState.js';
 import { formatElapsed, formatWallClock, presentationLabel } from './model.js';
+import { videoRateChangeForKey } from '../player/videoRate.js';
 
 /**
  * Speaker View: current and next slide, speaker notes, build position, presentation and slide
@@ -23,16 +25,21 @@ export interface SpeakerViewOptions {
   host: HTMLElement;
   resolveSrc: (src: string) => string;
   onCommand: (command: PresentationCommand) => void;
+  onNotesChange?: (slideId: string, notes: string) => void;
   /**
-   * Whether to offer the audience/presenter role swap. The desktop moves its
-   * two windows between displays; the browser cannot place windows, so it
-   * swaps the roles of the two surfaces in place instead. A shell with only
+   * Whether to offer the audience/presenter role swap. Both the desktop and
+   * the browser swap the roles of the two surfaces in place: each window keeps
+   * its display and loads the other's page. A shell with only
    * one surface passes false and the control is absent rather than inert.
    */
   canSwapDisplays?: boolean;
   /** Label for the swap control, which differs between window and tab shells. */
   swapLabel?: string;
   swapTitle?: string;
+  /** Label for the button that sends `exit`; a remote leaves rather than ending the show. */
+  endLabel?: string;
+  /** Further buttons for the footer, placed before End show (the browser's Remote…). */
+  extraActions?: HTMLElement[];
   /** Injectable clock, so timer formatting is testable without waiting. */
   now?: () => number;
 }
@@ -45,6 +52,11 @@ export interface SpeakerView {
   refresh(): void;
   /** Advance the clocks. Called on a timer internally; exposed for tests. */
   tick(): void;
+  toggleOverview(): void;
+  toggleGrid(): void;
+  closeOverview(): boolean;
+  isOverviewOpen(): boolean;
+  isGridOpen(): boolean;
   destroy(): void;
 }
 
@@ -66,12 +78,18 @@ const MARKUP = `
       </section>
       <section class="notes-panel" aria-label="Speaker notes">
         <h2>Notes</h2>
-        <div class="speaker-notes"></div>
+        <textarea class="speaker-notes" aria-label="Speaker notes for the current slide" placeholder="Notes for this slide…" spellcheck="true"></textarea>
       </section>
     </aside>
   </section>
+  <section class="speaker-overview" role="region" aria-label="Slides" hidden>
+    <div class="speaker-overview-heading"><h2>Slides</h2><button class="speaker-overview-close">Close</button></div>
+    <div class="speaker-overview-list"></div>
+  </section>
   <footer>
     <button class="speaker-prev">← Previous</button>
+    <button class="speaker-slides" aria-expanded="false" aria-keyshortcuts="O">Slides</button>
+    <button class="speaker-grid" aria-expanded="false" aria-keyshortcuts="G">All slides</button>
     <button class="speaker-blank">Blank</button>
     <button class="speaker-next-button primary">Next →</button>
     <button class="speaker-swap">Switch displays</button>
@@ -97,8 +115,17 @@ export function createSpeakerView(options: SpeakerViewOptions): SpeakerView {
   const presentationTimer = pick('.speaker-presentation-timer');
   const slideTimer = pick('.speaker-slide-timer');
   const wallClock = pick('.speaker-wall-clock');
-  const notes = pick('.speaker-notes');
+  const notes = pick<HTMLTextAreaElement>('.speaker-notes');
   const swap = pick<HTMLButtonElement>('.speaker-swap');
+  const end = pick<HTMLButtonElement>('.speaker-end');
+  const overview = pick('.speaker-overview');
+  const overviewList = pick('.speaker-overview-list');
+  const slidesButton = pick<HTMLButtonElement>('.speaker-slides');
+  const gridButton = pick<HTMLButtonElement>('.speaker-grid');
+  const layout = pick('.speaker-layout');
+  const footer = pick('footer');
+  if (options.endLabel) end.textContent = options.endLabel;
+  for (const action of options.extraActions ?? []) end.before(action);
 
   if (options.canSwapDisplays === false) {
     swap.remove();
@@ -115,6 +142,37 @@ export function createSpeakerView(options: SpeakerViewOptions): SpeakerView {
     startedAt: openedAt,
     slideStartedAt: openedAt,
   };
+  let overviewObserver: IntersectionObserver | null = null;
+  let overviewDeck: Deck | null = null;
+  let overviewRange = '';
+  let overviewMode: 'closed' | 'rail' | 'grid' = 'closed';
+  let returnToRail = false;
+  let shownNotesSlideId: string | null = null;
+  let committingNotes = false;
+
+  function commitNotes(): void {
+    if (committingNotes) return;
+    const slide = deck?.slides.find((item) => item.id === shownNotesSlideId);
+    if (!slide || notes.value === slide.notes) return;
+    const value = notes.value;
+    committingNotes = true;
+    try {
+      options.onNotesChange?.(slide.id, value);
+      slide.notes = value;
+    } finally {
+      committingNotes = false;
+    }
+  }
+
+  notes.disabled = !options.onNotesChange;
+  notes.addEventListener('change', commitNotes);
+  notes.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape') {
+      event.preventDefault();
+      notes.blur();
+    }
+    event.stopPropagation();
+  });
 
   function preview(target: HTMLElement, slideIndex: number, step = 0): void {
     // Every advance throws this preview away and builds another. A video still
@@ -152,7 +210,125 @@ export function createSpeakerView(options: SpeakerViewOptions): SpeakerView {
     while (nextSlide <= lastSlide && deck.slides[nextSlide]?.skipped) nextSlide += 1;
     preview(nextHost, nextSlide <= lastSlide ? nextSlide : -1);
     position.textContent = presentationLabel(state, deck.slides.length);
-    notes.textContent = deck.slides[state.cursor.slide]?.notes ?? '';
+    const slide = deck.slides[state.cursor.slide];
+    if (shownNotesSlideId !== slide?.id) commitNotes();
+    if (shownNotesSlideId !== slide?.id || document.activeElement !== notes) {
+      notes.value = slide?.notes ?? '';
+    }
+    shownNotesSlideId = slide?.id ?? null;
+    if (!overview.hidden) {
+      const range = `${state.range?.start ?? 0}:${state.range?.end ?? deck.slides.length - 1}`;
+      if (deck !== overviewDeck || range !== overviewRange) buildOverview();
+      for (const button of overviewList.querySelectorAll<HTMLButtonElement>('button[data-slide]')) {
+        if (Number(button.dataset.slide) === state.cursor.slide) button.setAttribute('aria-current', 'true');
+        else button.removeAttribute('aria-current');
+      }
+    }
+  }
+
+  function clearOverview(): void {
+    overviewObserver?.disconnect();
+    overviewObserver = null;
+    releasePreviewVideos(overviewList);
+    overviewList.replaceChildren();
+    overviewDeck = null;
+  }
+
+  function buildOverview(): void {
+    clearOverview();
+    if (!deck) return;
+    const start = state.range?.start ?? 0;
+    const end = state.range?.end ?? deck.slides.length - 1;
+    overviewDeck = deck;
+    overviewRange = `${start}:${end}`;
+    if (typeof IntersectionObserver !== 'undefined') {
+      overviewObserver = new IntersectionObserver((entries) => {
+        for (const entry of entries) {
+          const target = entry.target as HTMLElement;
+          if (entry.isIntersecting) preview(target, Number(target.dataset.slide));
+          else {
+            releasePreviewVideos(target);
+            target.replaceChildren();
+          }
+        }
+      }, { root: overviewList, rootMargin: '300px' });
+    }
+    for (let index = start; index <= end; index++) {
+      const slide = deck.slides[index];
+      if (!slide) continue;
+      const button = document.createElement('button');
+      button.className = `speaker-overview-slide${slide.skipped ? ' skipped' : ''}`;
+      button.dataset.slide = String(index);
+      button.setAttribute('aria-label', `Slide ${index + 1}: ${slide.name || 'Untitled'}${slide.skipped ? ', hidden' : ''}`);
+      const thumbnail = document.createElement('div');
+      thumbnail.className = 'preview';
+      thumbnail.dataset.slide = String(index);
+      const label = document.createElement('span');
+      label.className = 'speaker-overview-label';
+      label.textContent = `${index + 1}  ${slide.name || 'Untitled'}`;
+      button.append(thumbnail, label);
+      if (slide.skipped) {
+        const badge = document.createElement('span');
+        badge.className = 'speaker-overview-hidden';
+        badge.textContent = 'Hidden';
+        button.appendChild(badge);
+      }
+      button.addEventListener('click', () => {
+        onCommand({ type: 'goTo', slide: index });
+        if (overviewMode === 'grid') closeOverview();
+      });
+      overviewList.appendChild(button);
+      if (overviewObserver) overviewObserver.observe(thumbnail);
+      else preview(thumbnail, index);
+    }
+  }
+
+  function showOverview(mode: 'closed' | 'rail' | 'grid'): void {
+    overviewMode = mode;
+    overview.hidden = mode === 'closed';
+    host.classList.toggle('overview-open', mode === 'rail');
+    host.classList.toggle('overview-grid', mode === 'grid');
+    layout.inert = mode === 'grid';
+    footer.inert = mode === 'grid';
+    slidesButton.setAttribute('aria-expanded', String(mode === 'rail'));
+    gridButton.setAttribute('aria-expanded', String(mode === 'grid'));
+    overview.setAttribute('role', mode === 'grid' ? 'dialog' : 'region');
+    if (mode === 'grid') overview.setAttribute('aria-modal', 'true');
+    else overview.removeAttribute('aria-modal');
+    if (mode === 'closed') {
+      clearOverview();
+      slidesButton.focus();
+      return;
+    }
+    if (!overviewDeck) buildOverview();
+    render();
+    for (const thumbnail of overviewList.querySelectorAll<HTMLElement>('.preview')) {
+      const stage = thumbnail.querySelector<HTMLElement>('.stage');
+      if (!stage || !deck) continue;
+      const bounds = thumbnail.getBoundingClientRect();
+      applyStageScale(stage, deck, { w: bounds.width, h: bounds.height });
+    }
+    const current = overviewList.querySelector<HTMLElement>('[aria-current="true"]');
+    current?.scrollIntoView?.({ block: 'nearest' });
+    (current ?? pick('.speaker-overview-close')).focus();
+  }
+
+  function closeOverview(): boolean {
+    if (overviewMode === 'closed') return false;
+    showOverview(overviewMode === 'grid' && returnToRail ? 'rail' : 'closed');
+    return true;
+  }
+
+  function toggleOverview(): void {
+    showOverview(overviewMode === 'rail' ? 'closed' : 'rail');
+  }
+
+  function toggleGrid(): void {
+    if (overviewMode === 'grid') closeOverview();
+    else {
+      returnToRail = overviewMode === 'rail';
+      showOverview('grid');
+    }
   }
 
   function tick(): void {
@@ -166,7 +342,10 @@ export function createSpeakerView(options: SpeakerViewOptions): SpeakerView {
   pick('.speaker-prev').addEventListener('click', send({ type: 'prev' }));
   pick('.speaker-next-button').addEventListener('click', send({ type: 'next' }));
   pick('.speaker-blank').addEventListener('click', send({ type: 'toggleBlank' }));
-  pick('.speaker-end').addEventListener('click', send({ type: 'exit' }));
+  slidesButton.addEventListener('click', toggleOverview);
+  gridButton.addEventListener('click', toggleGrid);
+  pick('.speaker-overview-close').addEventListener('click', closeOverview);
+  end.addEventListener('click', send({ type: 'exit' }));
   if (swap.isConnected) swap.addEventListener('click', send({ type: 'swapDisplays' }));
 
   tick();
@@ -174,7 +353,9 @@ export function createSpeakerView(options: SpeakerViewOptions): SpeakerView {
 
   return {
     setDeck(next) {
+      commitNotes();
       deck = next;
+      if (next) prepareCodeBlocks(next);
       render();
     },
     setTheme(css) {
@@ -189,37 +370,64 @@ export function createSpeakerView(options: SpeakerViewOptions): SpeakerView {
       render();
       tick();
     },
-    refresh: render,
+    refresh() {
+      render();
+      if (!deck || overview.hidden) return;
+      for (const thumbnail of overviewList.querySelectorAll<HTMLElement>('.preview')) {
+        const stage = thumbnail.querySelector<HTMLElement>('.stage');
+        if (!stage) continue;
+        const bounds = thumbnail.getBoundingClientRect();
+        applyStageScale(stage, deck, { w: bounds.width, h: bounds.height });
+      }
+    },
     tick,
+    toggleOverview,
+    toggleGrid,
+    closeOverview,
+    isOverviewOpen: () => overviewMode !== 'closed',
+    isGridOpen: () => overviewMode === 'grid',
     destroy() {
+      commitNotes();
       clearInterval(clock);
+      clearOverview();
       theme?.remove();
       theme = null;
       host.replaceChildren();
-      host.classList.remove('speaker-view');
+      host.classList.remove('speaker-view', 'overview-open', 'overview-grid');
     },
   };
 }
 
 /**
  * The presenter key map. Deliberately narrower than the audience player's: a
- * speaker surface only ever forwards commands, so it never needs the player's
- * overview or home keys.
+ * speaker surface only ever forwards commands, apart from its local overview.
  */
 export function bindSpeakerKeys(
   target: Window | HTMLElement,
   onCommand: (command: PresentationCommand) => void,
+  overview?: Pick<SpeakerView, 'toggleOverview' | 'toggleGrid' | 'closeOverview' | 'isOverviewOpen' | 'isGridOpen'>,
 ): () => void {
   const onKey = (event: Event) => {
     const key = (event as KeyboardEvent).key;
+    if (overview?.isGridOpen() && !['Escape', 'o', 'O', 'g', 'G'].includes(key)) return;
+    const onControl = (event.target as HTMLElement | null)?.closest?.('button, input, select, textarea, [contenteditable]');
+    if (onControl && (key === 'Enter' || key === ' ')) return;
     if (['ArrowRight', 'ArrowDown', ' ', 'PageDown', 'Enter'].includes(key)) {
       onCommand({ type: 'next' });
     } else if (['ArrowLeft', 'ArrowUp', 'PageUp', 'Backspace'].includes(key)) {
       onCommand({ type: 'prev' });
     } else if (key === 'b' || key === 'B') {
       onCommand({ type: 'toggleBlank' });
+    } else if (key === 'o' || key === 'O') {
+      overview?.toggleOverview();
+    } else if (key === 'g' || key === 'G') {
+      overview?.toggleGrid();
     } else if (key === 'Escape') {
-      onCommand({ type: 'exit' });
+      // Escape ends the show even with the rail open, as it does without it;
+      // only the full-screen grid, a dialog over everything, closes first.
+      if (!(overview?.isGridOpen() && overview.closeOverview())) onCommand({ type: 'exit' });
+    } else if (videoRateChangeForKey(key)) {
+      onCommand({ type: 'videoRate', change: videoRateChangeForKey(key)! });
     } else {
       return;
     }

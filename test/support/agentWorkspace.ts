@@ -207,12 +207,26 @@ export function agentFixtureDeck(): Deck {
           // A theme class with a margin, and one that frames the picture.
           text('details-nudged', 'Nudged by its class', { x: 120, y: 420, w: 800, h: 80 }, { class: ['role-body', 'nudged'] }),
           { id: 'details-framed', type: 'image', x: 1000, y: 420, w: 400, h: 300, src: 'assets/pic.png', fit: 'cover', class: ['framed'], sourceBox: null },
-          { id: 'details-clip', type: 'video', x: 1450, y: 420, w: 400, h: 225, src: 'assets/clip.mp4', loop: false, muted: false, autoplay: false },
+          { id: 'details-clip', type: 'video', x: 1450, y: 420, w: 400, h: 225, src: 'assets/clip.mp4', loop: false, muted: false, autoplay: false, playbackRate: 0.5 },
           { id: 'details-curve', type: 'shape', shape: 'line', x: 120, y: 800, w: 600, h: 4, control: null, stroke: '#333333' },
           // A rotated brace pointing to its own −y: its depth rides on a data attribute.
           { id: 'details-brace', type: 'shape', shape: 'brace', x: 1200, y: 990, w: 500, h: 2, rot: 30, braceDepth: -50, stroke: '#333333' },
+          // Flipped and turned: a page reads this back as flipY at −60°, the
+          // same drawing, so it must come back spelt as the deck spells it.
+          { id: 'details-mirrored', type: 'shape', shape: 'path', x: 1450, y: 760, w: 300, h: 160, rot: 120, flipX: true, fill: '#cc5533', path: 'M0,0 L300,80 L0,160 Z', pathSize: { w: 300, h: 160 } },
           // A thick arrow with a head smaller than its width would give it.
           { id: 'details-arrow', type: 'shape', shape: 'arrow', x: 120, y: 1000, w: 500, h: 2, strokeWidth: 10, arrowEnd: true, arrowSize: 36, stroke: '#333333' },
+          // The line family: a pen path with an arrowhead, a dot and dashes; a
+          // line drawn with a marker and a bar on its end.
+          {
+            id: 'details-pen', type: 'shape', shape: 'path', x: 1300, y: 300, w: 400, h: 100, strokeWidth: 6,
+            stroke: '#333333', path: 'M 0 100 C 100 0 300 0 400 100', pathSize: { w: 400, h: 100 },
+            arrowEnd: true, startCap: 'dot', strokeDash: 'dashed', strokeStyle: 'pencil',
+          },
+          {
+            id: 'details-marker', type: 'shape', shape: 'line', x: 1300, y: 500, w: 400, h: 2, strokeWidth: 20,
+            stroke: '#ffcc00', strokeStyle: 'marker', endCap: 'bar', control: { x: 1500, y: 420 },
+          },
           {
             id: 'details-region', type: 'html', x: 800, y: 760, w: 300, h: 200,
             // As a browser serialises it, which is how the compile stores it.
@@ -434,11 +448,21 @@ export class HumanPeer {
     this.socket.send(JSON.stringify(message));
   }
 
-  /** Change the deck as a person would, as one transaction; resolves once the server has it. */
-  async edit(label: string, change: (deck: Deck) => void): Promise<boolean> {
+  /**
+   * Change the deck as a person would, as one transaction; resolves once the
+   * server has it. `textBases` stamps text replacements with the html they
+   * were edited from, as the browser client's live text sync does, so the
+   * server merges them with concurrent typing in the same box.
+   */
+  async edit(label: string, change: (deck: Deck) => void, options: { textBases?: boolean } = {}): Promise<boolean> {
     const next = structuredClone(this.deck);
     change(next);
-    const ops = diffDecks(this.deck, parseDeck(next));
+    const ops = diffDecks(this.deck, parseDeck(next)).map((op) => {
+      if (!options.textBases || op.op !== 'replaceElement' || !('html' in op.element)) return op;
+      const before = this.deck.slides.find((slide) => slide.id === op.slideId)
+        ?.elements.find((element) => element.id === op.elementId);
+      return before && 'html' in before && typeof before.html === 'string' ? { ...op, baseHtml: before.html } : op;
+    });
     if (ops.length === 0) return false;
     const txnId = `human-${randomUUID()}`;
     const echoed = new Promise<void>((resolvePromise, reject) => {

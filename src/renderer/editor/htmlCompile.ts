@@ -14,6 +14,8 @@ import {
   type SlideBase,
 } from '@shared/htmlSlides.js';
 import { PLAYER_TYPE_CSS } from '@shared/playerTypeCss.js';
+import { termBuildWarnings } from '@shared/equationTerms.js';
+import { mathWarnings } from '@shared/mathDelimiters.js';
 import { browserDeckRevision } from './agentBridge.js';
 import { sanitizeAuthoredHtml, type HtmlSanitizationReport } from '@shared/htmlSafety.js';
 
@@ -34,7 +36,11 @@ import { sanitizeAuthoredHtml, type HtmlSanitizationReport } from '@shared/htmlS
 
 export interface CompiledAuthoredHtml {
   slides: Slide[];
-  /** Inline style the browser silently dropped; see `MeasuredSlide.warnings`. */
+  /**
+   * Inline style the browser silently dropped (see `MeasuredSlide.warnings`)
+   * maths a text element leaves unclosed (`mathWarnings`), and term builds
+   * with no terms to step through (`termBuildWarnings`).
+   */
   warnings: string[];
   sanitization: HtmlSanitizationReport;
   /** What the page says its slides were when it was exported (`pageBases`). */
@@ -94,9 +100,11 @@ export async function compileAuthoredHtml(
     await doc.fonts?.ready;
     await nextFrame();
     const measured = measureSlides(doc);
+    const slides = slidesFromMeasured(deck, measured);
     return {
-      slides: slidesFromMeasured(deck, measured),
-      warnings: measured.flatMap((slide) => slide.warnings ?? []),
+      slides,
+      warnings: [...measured.flatMap((slide) => slide.warnings ?? []), ...mathWarnings(slides, authored),
+        ...termBuildWarnings(slides)],
       bases: pageBases(measured),
       sanitization: sanitized.report,
     };

@@ -1,5 +1,5 @@
 import { renameRetiredFields } from '@shared/fieldAliases.js';
-import { setMediaVariants } from './mediaVariants.js';
+import { setMediaVariants, setPendingMedia } from './mediaVariants.js';
 import type { AgentOperation } from '@shared/agent.js';
 import { applyOpsLenient } from '@shared/collabApply.js';
 import {
@@ -7,9 +7,11 @@ import {
   COLLAB_PROTOCOL_VERSION,
   ServerMessageSchema,
   type ClientMessage,
+  type ClientRemoteMessage,
   type CursorPosition,
   type PresenceState,
   type ServerDeckMovedMessage,
+  type ServerRemoteMessage,
   type ServerWelcomeMessage,
 } from '@shared/collab.js';
 import type { ChatMessage, ChatRef } from '@shared/chat.js';
@@ -17,6 +19,8 @@ import type { Deck } from '@shared/deck.js';
 import { diffDecks } from '@shared/deckDiff.js';
 import { withoutCommentOps } from '@shared/comments.js';
 import { makeId } from '@shared/geometry.js';
+import { jsonEqual } from '@shared/jsonData.js';
+import type { MergeInput, MergeResult } from '@shared/deckMerge.js';
 import type { RemoteHistoryOptions } from '../editor/store.js';
 
 /**
@@ -37,6 +41,12 @@ import type { RemoteHistoryOptions } from '../editor/store.js';
  */
 
 const UNDO_LIMIT = 200;
+/**
+ * A socket that has not opened by now is given up and retried. A server
+ * behind a route that dropped (a tailnet link gone) never refuses: without
+ * this the handshake hangs for minutes, and nothing says the session is down.
+ */
+const CONNECT_TIMEOUT_MS = 10_000;
 
 interface UndoEntry {
   label: string;
@@ -58,6 +68,12 @@ export interface CollabBridgeHooks {
   onPeerCursor: (clientId: string, cursor: CursorPosition | null) => void;
   onPeerLeft: (clientId: string) => void;
   onThemeCss: (css: string) => void;
+  /**
+   * The server now names a different variant for these srcs (a streaming
+   * version landed): every URL built from here on asks for it, and surfaces
+   * holding the old URL should move what they can.
+   */
+  onMediaVariants?: (srcs: string[]) => void;
   /** One accepted chat message, including the echo of this client's own. */
   onChat?: (message: ChatMessage) => void;
   onStatus: (text: string) => void;
@@ -91,6 +107,41 @@ export interface CollabBridgeHooks {
    * tell the user that work done while disconnected did not survive.
    */
   onEditsDiscarded?: (count: number) => void;
+  /** A message about the remote (remoteControl.ts), from the one peer it is shared with. */
+  onRemote?: (message: ServerRemoteMessage) => void;
+  /** The server refuses this person the deck (close 4003); the bridge has stopped. */
+  onAccessRevoked?: () => void;
+}
+
+/**
+ * Keep working without the server. The desktop editing a server deck sets
+ * this: its edits go on landing while the connection is down, and the next
+ * welcome does not throw them away (the browser's contract) but merges them
+ * with what everybody else did meanwhile.
+ */
+export interface OfflineSync {
+  /** The deck and stylesheet on screen now, unsent edits included. */
+  local(): { deck: Deck; themeCss: string };
+  /**
+   * Settle the two sides. `base` is the last server state this replica
+   * knew; the promise may wait for a person to choose, slide by slide.
+   */
+  reconcile(input: Required<MergeInput>): Promise<MergeResult>;
+  /** The merge landed (or there was nothing to merge): `changes` local edits went up. */
+  onReconciled?(summary: { sent: number; themeSent: boolean }): void;
+}
+
+/** The last server state this replica knew, consistent with what it shows. */
+export interface SyncBaseline {
+  deck: Deck;
+  themeCss: string;
+  seq: number;
+}
+
+/** How this peer introduces itself beyond its name: see PresenceState. */
+export interface CollabSurface {
+  presenting?: boolean;
+  device?: 'phone';
 }
 
 export class CollabBridge {
@@ -105,12 +156,56 @@ export class CollabBridge {
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private closed = false;
   private participant: string | undefined;
+  private surface: CollabSurface = {};
+  /** The stylesheet as the server last told it (welcome or a peer's change). */
+  private shadowTheme: string | null = null;
+  /** What this peer last sent while connected; the server does not echo it. */
+  private sentTheme: string | null = null;
+  /**
+   * Set while a reconnect merge waits on `OfflineSync.reconcile`: the base it
+   * merges from stays the persisted baseline until the result lands.
+   */
+  private reconciling: { generation: number; base: SyncBaseline } | null = null;
+  private reconcileGeneration = 0;
 
   constructor(
     private readonly url: string,
     private name: string | undefined,
     private readonly hooks: CollabBridgeHooks,
+    private readonly offline?: OfflineSync,
   ) {}
+
+  /**
+   * Start from a server state remembered from an earlier session — the
+   * desktop's copy of a server deck, reopened. With `OfflineSync`, the first
+   * welcome then merges what was edited since instead of replacing it.
+   */
+  seed(baseline: SyncBaseline): void {
+    this.shadow = baseline.deck;
+    this.shadowTheme = baseline.themeCss;
+    this.seq = baseline.seq;
+  }
+
+  /**
+   * The server state to persist beside the local deck so a later session can
+   * merge from it. Everything in it is already on screen: while a merge is
+   * pending it stays the state the merge started from.
+   */
+  baseline(): SyncBaseline | null {
+    if (this.reconciling) return this.reconciling.base;
+    if (!this.shadow) return null;
+    return { deck: this.shadow, themeCss: this.sentTheme ?? this.shadowTheme ?? '', seq: this.seq };
+  }
+
+  /** Local transactions the server has not confirmed (all of them, while offline). */
+  get unconfirmed(): number {
+    return this.pending.length;
+  }
+
+  /** True while a reconnect merge is waiting to be settled. */
+  get isReconciling(): boolean {
+    return this.reconciling !== null;
+  }
 
   /**
    * Set the hello name before connect(). On an access-controlled server the
@@ -130,17 +225,34 @@ export class CollabBridge {
     this.participant = participant;
   }
 
+  /** Say what kind of peer this is in the hello. Set before connect(). */
+  setSurface(surface: CollabSurface): void {
+    this.surface = surface;
+  }
+
+  /** Whether the socket is open: the server is reachable, whether or not it has welcomed us yet. */
+  get open(): boolean {
+    return this.socket?.readyState === WebSocket.OPEN;
+  }
+
   connect(): void {
     this.closed = false;
     const socket = new WebSocket(this.url);
     this.socket = socket;
+    const handshake = setTimeout(() => {
+      if (socket.readyState === WebSocket.CONNECTING) socket.close();
+    }, CONNECT_TIMEOUT_MS);
+    socket.addEventListener('close', () => clearTimeout(handshake));
     socket.addEventListener('open', () => {
+      clearTimeout(handshake);
       this.reconnectDelay = 500;
       this.send({
         kind: 'hello',
         version: COLLAB_PROTOCOL_VERSION,
         name: this.name,
         ...(this.participant ? { participant: this.participant } : {}),
+        ...(this.surface.presenting ? { presenting: true } : {}),
+        ...(this.surface.device ? { device: this.surface.device } : {}),
       });
     });
     socket.addEventListener('message', (event) => {
@@ -159,6 +271,7 @@ export class CollabBridge {
       if (event.code === 4003) {
         this.closed = true;
         this.hooks.onStatus(event.reason || 'You no longer have access to this presentation');
+        this.hooks.onAccessRevoked?.();
         return;
       }
       // A deck that is not there (or was renamed: that close follows a
@@ -187,6 +300,15 @@ export class CollabBridge {
   rename(name: string): void {
     this.setName(name);
     if (this.socket && this.socket.readyState === WebSocket.OPEN) this.socket.close();
+  }
+
+  /** Skip the rest of a reconnect backoff and try now (a "Retry" button, a network that came back). */
+  reconnectNow(): void {
+    if (this.closed || !this.reconnectTimer) return;
+    clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = null;
+    this.reconnectDelay = 500;
+    this.connect();
   }
 
   close(): void {
@@ -263,6 +385,7 @@ export class CollabBridge {
   }
 
   sendTheme(css: string): void {
+    if (this.socket?.readyState === WebSocket.OPEN && !this.reconciling) this.sentTheme = css;
     this.send({ kind: 'theme', css });
   }
 
@@ -276,6 +399,11 @@ export class CollabBridge {
     if (this.socket?.readyState !== WebSocket.OPEN) return false;
     this.send({ kind: 'chat-post', ...post });
     return true;
+  }
+
+  /** Relay a remote message; dropped while disconnected, like presence. */
+  sendRemote(message: ClientRemoteMessage): void {
+    this.send(message);
   }
 
   private seq = 0;
@@ -301,6 +429,99 @@ export class CollabBridge {
     this.send({ kind: 'txn', txnId, baseSeq: this.seq, label, ops: forward });
   }
 
+  /**
+   * A (re)connect with offline edits to keep: merge the server's deck with
+   * the one on screen from the last server state both had seen, send the
+   * difference, and only then let the welcome through to the shell.
+   */
+  private reconcileWelcome(message: ServerWelcomeMessage): void {
+    const offline = this.offline!;
+    const remote = message.deck;
+    const remoteTheme = message.themeCss;
+    const baseSeq = this.seq;
+    this.seq = message.seq;
+    this.hooks.onConnectionChange?.(true);
+    // A second welcome while a merge is still open (the link dropped again
+    // under the dialog) only moves the server state the result lands on.
+    if (this.reconciling) {
+      this.shadow = remote;
+      this.shadowTheme = remoteTheme;
+      this.sentTheme = null;
+      this.pending = [];
+      return;
+    }
+    const base = this.shadow!;
+    // The server does not echo a stylesheet back to its sender: if it holds
+    // the one this peer sent last, that is the base; otherwise the send was
+    // lost with the connection and the base is what the server said before.
+    const baseTheme = this.sentTheme !== null && remoteTheme === this.sentTheme
+      ? this.sentTheme
+      : this.shadowTheme ?? remoteTheme;
+    const local = offline.local();
+    this.shadow = remote;
+    this.shadowTheme = remoteTheme;
+    this.sentTheme = null;
+    this.pending = [];
+    if (jsonEqual(local.deck, base) && local.themeCss === baseTheme) {
+      // Nothing was edited here while apart: the server's deck is the deck.
+      this.hooks.onCleanChange(true);
+      this.hooks.onWelcome(message);
+      offline.onReconciled?.({ sent: 0, themeSent: false });
+      return;
+    }
+    const generation = ++this.reconcileGeneration;
+    this.reconciling = { generation, base: { deck: base, themeCss: baseTheme, seq: baseSeq } };
+    void offline.reconcile({
+      base, local: local.deck, remote,
+      baseTheme, localTheme: local.themeCss, remoteTheme,
+    }).then(
+      (result) => this.finishReconcile(generation, message, remote, remoteTheme, result),
+      (error) => {
+        console.error('collab: could not merge offline edits', error);
+        // Keep everything local: the next welcome tries again from the same base.
+        if (this.reconciling?.generation !== generation) return;
+        this.shadow = this.reconciling.base.deck;
+        this.shadowTheme = this.reconciling.base.themeCss;
+        this.reconciling = null;
+        this.hooks.onStatus(`Could not merge offline edits: ${error instanceof Error ? error.message : error}`);
+        this.socket?.close();
+      },
+    );
+  }
+
+  private finishReconcile(
+    generation: number,
+    welcome: ServerWelcomeMessage,
+    remote: Deck,
+    remoteTheme: string,
+    result: MergeResult,
+  ): void {
+    if (this.reconciling?.generation !== generation) return;
+    this.reconciling = null;
+    const ops = diffDecks(remote, result.deck);
+    if (ops.length > 0) {
+      const txnId = makeId('txn');
+      const label = 'Synchronize offline edits';
+      this.pending.unshift({ txnId, label, ops });
+      this.send({ kind: 'txn', txnId, baseSeq: this.seq, label, ops });
+    }
+    const themeCss = result.themeCss ?? remoteTheme;
+    const themeSent = themeCss !== remoteTheme;
+    if (themeSent) this.sendTheme(themeCss);
+    // The server may have moved on while a person was choosing: the merge
+    // lands on top of whatever it holds now, like any other edit.
+    let ui = this.shadow!;
+    for (const p of this.pending) ui = applyOpsLenient(ui, p.ops).deck;
+    this.hooks.onCleanChange(this.pending.length === 0);
+    this.hooks.onWelcome({
+      ...welcome,
+      seq: this.seq,
+      deck: ui,
+      themeCss: themeSent ? themeCss : this.shadowTheme ?? remoteTheme,
+    });
+    this.offline?.onReconciled?.({ sent: ops.length, themeSent });
+  }
+
   private send(message: ClientMessage): void {
     if (this.socket?.readyState === WebSocket.OPEN) {
       this.socket.send(JSON.stringify(message));
@@ -311,10 +532,20 @@ export class CollabBridge {
     const message = ServerMessageSchema.parse(renameRetiredFields(raw));
     switch (message.kind) {
       case 'welcome': {
-        setMediaVariants(message.mediaVariants, true);
+        const changedMedia = [...new Set([
+          ...setMediaVariants(message.mediaVariants, true),
+          ...setPendingMedia(message.pendingMedia ?? []),
+        ])];
+        if (changedMedia.length > 0) this.hooks.onMediaVariants?.(changedMedia);
         this.clientId = message.clientId;
+        if (this.offline && (this.shadow || this.reconciling)) {
+          this.reconcileWelcome(message);
+          return;
+        }
         this.seq = message.seq;
         this.shadow = message.deck;
+        this.shadowTheme = message.themeCss;
+        this.sentTheme = null;
         // A reconnect abandons unconfirmed work: the server state wins, the
         // same contract as an external rewrite. That makes the server's deck a
         // new base, so the inverses queued against the discarded optimistic one
@@ -335,15 +566,20 @@ export class CollabBridge {
         this.shadow = applyOpsLenient(this.shadow, message.ops).deck;
         const mineIndex = this.pending.findIndex((p) => p.txnId === message.txnId);
         if (mineIndex !== -1) this.pending.splice(mineIndex, 1);
+        // The screen still shows the unmerged local deck; the merge result
+        // lands on whatever the server has by the time it is settled.
+        if (this.reconciling) return;
         // UI = shadow + everything still pending, replayed in order.
         let ui = this.shadow;
         for (const p of this.pending) ui = applyOpsLenient(ui, p.ops).deck;
         this.replayingHistory = true;
         try {
           const fromAgentApi = message.byClientId === 'agent-http';
+          // A deck.json somebody wrote on the server, merged in there.
+          const fromDisk = message.byClientId === 'disk';
           this.hooks.onDeckReplaced(
             ui,
-            fromAgentApi ? 'Agent edit' : mineIndex !== -1 ? message.label : `${message.label} (remote)`,
+            fromAgentApi ? 'Agent edit' : mineIndex !== -1 || fromDisk ? message.label : `${message.label} (remote)`,
             // Every applied agent draft is a deliberate revision, even when an
             // agent happens to reuse the same label. Never fold two of them
             // into one History snapshot.
@@ -351,7 +587,7 @@ export class CollabBridge {
               coalesce: false,
               description: describeAgentEdit(message.label, message.ops),
               agentChatId: message.agentChatId,
-            } : undefined,
+            } : fromDisk ? { coalesce: false } : undefined,
           );
         } finally {
           this.replayingHistory = false;
@@ -362,18 +598,26 @@ export class CollabBridge {
       case 'deck': {
         this.seq = message.seq;
         this.shadow = message.deck;
-        this.pending = [];
+        // A resync answers a transaction the server refused: what is pending
+        // will never be confirmed. Anything else (an agent's edit sent as a
+        // whole deck) was decided before the server saw what is still
+        // pending here, and it applies those on top when they arrive — so
+        // they stay on screen, replayed over the new deck, as a txn does.
+        if (message.reason === 'resync') this.pending = [];
+        if (this.reconciling) return;
         if (message.reason !== 'agent-edit') {
           // A filesystem replacement/resync establishes a new base. Inverses
           // computed against the discarded base must never be replayed later.
           this.undoStack = [];
           this.redoStack = [];
         }
-        this.hooks.onCleanChange(true);
+        if (this.pending.length === 0) this.hooks.onCleanChange(true);
+        let ui = message.deck;
+        for (const p of this.pending) ui = applyOpsLenient(ui, p.ops).deck;
         this.replayingHistory = true;
         try {
           if (message.reason === 'agent-edit') {
-            this.hooks.onDeckReplaced(message.deck, 'Agent edit', {
+            this.hooks.onDeckReplaced(ui, 'Agent edit', {
               coalesce: false,
               description: message.label
                 ?? 'The Agent updated the presentation through its deck authoring workspace.',
@@ -381,7 +625,7 @@ export class CollabBridge {
             });
           } else {
             this.hooks.onDeckReplaced(
-              message.deck,
+              ui,
               message.reason === 'resync' ? 'Server resync' : 'External edit',
               { coalesce: false, history: false },
             );
@@ -401,13 +645,26 @@ export class CollabBridge {
         this.hooks.onPeerLeft(message.clientId);
         return;
       case 'theme':
+        this.shadowTheme = message.css;
+        this.sentTheme = null;
+        if (this.reconciling) return;
         this.hooks.onThemeCss(message.css);
         return;
-      case 'media':
-        setMediaVariants(message.variants);
+      case 'media': {
+        const changed = [...new Set([...setMediaVariants(message.variants), ...setPendingMedia(message.pending)])];
+        if (changed.length > 0) this.hooks.onMediaVariants?.(changed);
         return;
+      }
       case 'chat':
         this.hooks.onChat?.(message.message);
+        return;
+      case 'remote-offer':
+      case 'remote-answer':
+      case 'remote-command':
+      case 'remote-state':
+      case 'remote-end':
+      case 'remote-request':
+        this.hooks.onRemote?.(message);
         return;
       case 'ended':
         // Deliberate teardown, not a network blip: don't reconnect.

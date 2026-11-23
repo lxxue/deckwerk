@@ -133,7 +133,7 @@ describe.skipIf(!electronBinary)('text formatting in the collaboration browser',
     // tab. Nothing below assumes which side panel happened to open first.
     const panelLabels = await editor.evaluate<string[]>(
       `[...document.querySelectorAll('#side-tabs button')].map((b) => b.textContent.trim())`);
-    expect(panelLabels).toEqual(['Props', 'Design', 'Build', 'History', 'Chat']);
+    expect(panelLabels).toEqual(['Props', 'Design', 'Build', 'Chat']);
     await editor.click('#side-tabs button[data-panel="themePanel"]', 'Design tab');
     await editor.click('#side-tabs button[data-panel="inspector"]', 'Props tab');
     expect(await editor.evaluate<boolean>(
@@ -203,9 +203,11 @@ describe.skipIf(!electronBinary)('text formatting in the collaboration browser',
       const item = document.querySelector('#canvas [data-element-id="${BODY_ID}"] .text-body li');
       if (getComputedStyle(item).listStyleType !== 'none') return true;
       const marker = getComputedStyle(item, '::before');
+      // While the box is edited the disc is a shadow (editor.css).
+      const shadow = marker.boxShadow && marker.boxShadow !== 'none';
       const painted = marker.content !== 'none' && marker.display !== 'none'
-        && parseFloat(marker.minWidth || marker.width) > 0
-        && (marker.content !== '""' || marker.backgroundImage !== 'none');
+        && (parseFloat(marker.minWidth || marker.width) > 0 || shadow)
+        && (marker.content !== '""' || marker.backgroundImage !== 'none' || shadow);
       return painted;
     })()`), 'the bullet marker does not paint').toBe(true);
 

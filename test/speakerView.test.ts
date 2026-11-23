@@ -90,11 +90,56 @@ describe('speaker view', () => {
     deck.slides[1]!.notes = 'Say <b>this</b>\nthen that';
     view.setDeck(deck);
     const notes = host.querySelector('.speaker-notes')!;
-    expect(notes.textContent).toBe('');
+    expect((notes as HTMLTextAreaElement).value).toBe('');
 
     view.setState(state({ cursor: { slide: 1, step: 0 } }));
-    expect(notes.textContent).toBe('Say <b>this</b>\nthen that');
+    expect((notes as HTMLTextAreaElement).value).toBe('Say <b>this</b>\nthen that');
     expect(notes.children).toHaveLength(0);
+    view.destroy();
+  });
+
+  it('edits notes for the current slide and keeps typing out of the presentation shortcuts', () => {
+    const edits: Array<{ slideId: string; notes: string }> = [];
+    const view = open({ onNotesChange: (slideId, notes) => edits.push({ slideId, notes }) });
+    view.setDeck(deckOf(['Intro', 'Method']));
+    view.setState(state({ cursor: { slide: 1, step: 0 } }));
+    const unbind = bindSpeakerKeys(window, (command) => commands.push(command), view);
+    const notes = host.querySelector<HTMLTextAreaElement>('.speaker-notes')!;
+    notes.focus();
+    notes.value = '- First point\n- Second point';
+    notes.dispatchEvent(new KeyboardEvent('keydown', { key: ' ', bubbles: true }));
+    notes.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true }));
+    expect(commands).toEqual([]);
+
+    notes.dispatchEvent(new Event('change'));
+    expect(edits).toEqual([{ slideId: 's2', notes: '- First point\n- Second point' }]);
+    view.setState(state({ cursor: { slide: 0, step: 0 } }));
+    expect(notes.value).toBe('');
+    unbind();
+    view.destroy();
+  });
+
+  it('keeps a seeded walk of note edits and slide jumps on their slide ids', () => {
+    const deck = deckOf(['Intro', 'Method', 'Results']);
+    const saved = new Map<string, string>();
+    const view = open({ onNotesChange: (slideId, notes) => saved.set(slideId, notes) });
+    view.setDeck(deck);
+    const notes = host.querySelector<HTMLTextAreaElement>('.speaker-notes')!;
+    let seed = 17;
+    let slide = 0;
+    view.setState(state({ cursor: { slide, step: 0 } }));
+    for (let step = 0; step < 30; step += 1) {
+      seed = (seed * 16807) % 2147483647;
+      if (seed % 3 === 0) {
+        slide = seed % deck.slides.length;
+        view.setState(state({ cursor: { slide, step: 0 } }));
+      } else {
+        notes.value = `Note ${step}`;
+        notes.dispatchEvent(new Event('change'));
+      }
+      expect(notes.value).toBe(saved.get(deck.slides[slide].id) ?? '');
+    }
+    for (const item of deck.slides) expect(item.notes).toBe(saved.get(item.id) ?? '');
     view.destroy();
   });
 
@@ -136,6 +181,87 @@ describe('speaker view', () => {
 
     expect(commands.map((command) => command.type))
       .toEqual(['prev', 'next', 'toggleBlank', 'swapDisplays', 'exit']);
+    view.destroy();
+  });
+
+  it('opens a docked slide rail and jumps to a chosen slide', () => {
+    const view = open();
+    view.setDeck(deckOf(['Intro', 'Hidden', 'Method', 'Results'], [1]));
+    view.setState(state({ cursor: { slide: 2, step: 0 } }));
+    host.querySelector<HTMLButtonElement>('.speaker-slides')!.click();
+
+    const overview = host.querySelector<HTMLElement>('.speaker-overview')!;
+    const slides = [...overview.querySelectorAll<HTMLButtonElement>('.speaker-overview-slide')];
+    expect(overview.hidden).toBe(false);
+    expect(slides.map((slide) => slide.dataset.slide)).toEqual(['0', '1', '2', '3']);
+    expect(slides[1].querySelector('.speaker-overview-hidden')!.textContent).toBe('Hidden');
+    expect(slides[2].getAttribute('aria-current')).toBe('true');
+    expect(slides[3].querySelector('.preview')!.textContent).toContain('Results');
+
+    slides[1].click();
+    slides[3].click();
+    expect(commands).toEqual([{ type: 'goTo', slide: 1 }, { type: 'goTo', slide: 3 }]);
+    expect(overview.hidden).toBe(false);
+    expect(host.classList.contains('overview-open')).toBe(true);
+    view.destroy();
+  });
+
+  it('opens the full grid with G and returns to the rail on Escape', () => {
+    const view = open();
+    view.setDeck(deckOf(['Intro', 'Backup', 'Results'], [1]));
+    const unbind = bindSpeakerKeys(window, (command) => commands.push(command), view);
+    view.toggleOverview();
+
+    window.dispatchEvent(new KeyboardEvent('keydown', { key: 'g', cancelable: true }));
+    expect(host.classList.contains('overview-grid')).toBe(true);
+    expect(host.querySelector('.speaker-overview')!.getAttribute('role')).toBe('dialog');
+    expect(host.querySelectorAll('.speaker-overview-slide')).toHaveLength(3);
+
+    window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', cancelable: true }));
+    expect(host.classList.contains('overview-open')).toBe(true);
+    expect(view.isGridOpen()).toBe(false);
+    expect(commands).toEqual([]);
+    unbind();
+    view.destroy();
+  });
+
+  it('returns to the presentation after choosing a slide in the grid', () => {
+    const view = open();
+    view.setDeck(deckOf(['Intro', 'Backup', 'Results'], [1]));
+    view.toggleGrid();
+
+    host.querySelector<HTMLButtonElement>('.speaker-overview-slide[data-slide="1"]')!.click();
+
+    expect(commands).toEqual([{ type: 'goTo', slide: 1 }]);
+    expect(view.isOverviewOpen()).toBe(false);
+    view.destroy();
+  });
+
+  it('lets focused controls handle Enter and Space without advancing', () => {
+    const view = open();
+    view.setDeck(deckOf(['Intro', 'Method']));
+    const unbind = bindSpeakerKeys(window, (command) => commands.push(command), view);
+    const slides = host.querySelector<HTMLButtonElement>('.speaker-slides')!;
+
+    slides.dispatchEvent(new KeyboardEvent('keydown', { key: ' ', bubbles: true, cancelable: true }));
+    expect(commands).toEqual([]);
+    slides.click();
+    const tile = host.querySelector<HTMLButtonElement>('.speaker-overview-slide')!;
+    tile.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }));
+    expect(commands).toEqual([]);
+
+    unbind();
+    view.destroy();
+  });
+
+  it('shows only slides in the presentation range', () => {
+    const view = open();
+    view.setDeck(deckOf(['Intro', 'Method', 'Results', 'Appendix']));
+    view.setState(state({ cursor: { slide: 1, step: 0 }, range: { start: 1, end: 2 } }));
+    view.toggleOverview();
+
+    expect([...host.querySelectorAll<HTMLElement>('.speaker-overview-slide')]
+      .map((slide) => slide.dataset.slide)).toEqual(['1', '2']);
     view.destroy();
   });
 
@@ -210,6 +336,26 @@ describe('speaker view', () => {
     window.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowRight' }));
     expect(commands).toHaveLength(5);
   });
+
+  it('uses O for the rail, and Escape ends the show even while the rail is open', () => {
+    const view = open();
+    view.setDeck(deckOf(['Intro', 'Method']));
+    const unbind = bindSpeakerKeys(window, (command) => commands.push(command), view);
+    window.dispatchEvent(new KeyboardEvent('keydown', { key: 'o', cancelable: true }));
+    expect(view.isOverviewOpen()).toBe(true);
+    window.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowRight', cancelable: true }));
+    expect(commands).toEqual([{ type: 'next' }]);
+    window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', cancelable: true }));
+    expect(commands).toEqual([{ type: 'next' }, { type: 'exit' }]);
+    // The grid is a dialog over everything: Escape closes it first.
+    window.dispatchEvent(new KeyboardEvent('keydown', { key: 'g', cancelable: true }));
+    expect(view.isGridOpen()).toBe(true);
+    window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', cancelable: true }));
+    expect(view.isGridOpen()).toBe(false);
+    expect(commands).toEqual([{ type: 'next' }, { type: 'exit' }]);
+    unbind();
+    view.destroy();
+  });
 });
 
 describe('desktop Speaker View window', () => {
@@ -235,6 +381,7 @@ describe('desktop Speaker View window', () => {
       onDeckState: (fn: (session: { deck: Deck }) => void) => { deckListener = fn; },
       onPresentState: (fn: (state: PresentationState) => void) => { stateListener = fn; },
       sendPresentCommand: (command: PresentationCommand) => sent.push(command),
+      editPresentNotes: vi.fn(),
     });
 
     vi.resetModules();

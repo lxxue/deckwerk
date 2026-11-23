@@ -1,11 +1,45 @@
 import { openContextMenu } from './contextMenuPlacement.js';
-import type { Deck, Slide, SlideElement, TextEl } from '@shared/deck.js';
+import type { Deck, ShapeEl, Slide, SlideElement, TextEl } from '@shared/deck.js';
 import { NEW_MEDIA_FIT } from '@shared/deck.js';
 import { lineSpacingValue } from '@shared/lineHeight.js';
 import { canHoldText, shapeToTextBox } from '@shared/shapeText.js';
-import { moveCorner, polygonPoints } from '@shared/polygonShape.js';
+import { flipped, moveCorner, polygonPoints } from '@shared/polygonShape.js';
+import { flipsOf } from '@shared/flip.js';
+import {
+  bendSegment,
+  constrainAngle,
+  drawnAtPixelScale,
+  freehandRun,
+  insertNode,
+  moveHandle,
+  moveNode,
+  nearestOnPath,
+  pathOnCanvas,
+  redrawPathAtSize,
+  removeNode,
+  serializePath,
+  toggleSmooth,
+  type SubPath,
+} from '@shared/pathNodes.js';
+import {
+  bendLine,
+  controlFromHandle,
+  editableRuns,
+  isLineFamily,
+  isTwoPointLine,
+  lineEndpoints,
+  lineFromEndpoints,
+  lineRun,
+  setEditableRuns,
+} from '@shared/lineFamily.js';
+import {
+  PEN_POINT_SCREEN_PX, PENCIL_TOLERANCE_SCREEN_PX, PenDraft, pathOverlay, penOverlay, pencilOverlay,
+  type DrawingTool, type OverlayKnob,
+} from './pathTools.js';
+import { newObjectColors } from '@shared/themes.js';
+import { insertPath } from './elementCreation.js';
 import { braceDepthToward, bracePolyline, braceTip } from '@shared/brace.js';
-import { type Rect, fitScale, makeId } from '@shared/geometry.js';
+import { type Rect, fitScale, makeId, snapAngle } from '@shared/geometry.js';
 
 type XY = { x: number; y: number };
 import {
@@ -19,21 +53,33 @@ import {
   renderElement,
   renderSlide,
   scheduleAutoFit,
+  startVideoSource,
   syncMediaFrame,
+  videoNetworkSrc,
 } from '../player/render.js';
 import { decodeImage } from '../player/imageDecode.js';
 import { DecodedVideoPool, releaseDecodedVideo } from '../player/decodedVideoPool.js';
 import { ungateVideoLoad } from '../player/mediaLoadGate.js';
 import { openSlideLinkInNewTab, slideLinkFromEvent } from '../player/links.js';
 import { expandTimeline } from '@shared/timeline.js';
-import { mapTextOffset, mergeTextHtml } from '@shared/textMerge.js';
+import { mergeTextHtml } from '@shared/textMerge.js';
 import {
   BASELINE_RUN_FONT_SIZE, isRelativeFontSize, restoreKatexSourceHtml,
   pastedHtmlHasMedia, sanitizePastedTextHtml, stripFittedFontSize, stripLayoutDeclarations,
   stripTextMediaPayloads,
   textOnlyPastedHtml,
 } from '@shared/htmlSafety.js';
-import { isBaselineFormat, type BaselineFormat, type InlineTextFormat } from './textFormatting.js';
+import {
+  DECORATION_LINES,
+  decorationLineValue,
+  isBaselineFormat,
+  isDecorationFormat,
+  isDecorationTag,
+  otherDecoration,
+  type BaselineFormat,
+  type DecorationFormat,
+  type InlineTextFormat,
+} from './textFormatting.js';
 import { classifyMediaName, isPendingSrc, makePendingSrc, mediaFileName, pendingToken } from '@shared/media.js';
 import {
   normalizeParagraphHtml,
@@ -41,15 +87,22 @@ import {
   paragraphUnits,
   paragraphsToList,
   paragraphsToOrderedList,
+  retagList,
+  clearListMarkerOverrides,
   applyTableColumnWidths,
   pastedTableData,
+  LIST_HOLDER_ATTRIBUTE,
   LIST_MARKER_COLOR_ATTRIBUTE,
+  mergeAdjacentLists,
   LIST_MARKER_COLOR_PROPERTY,
   TYPING_STYLE_SENTINEL,
+  paragraphIndent,
+  setParagraphIndent,
   type ListMarkerColorState,
 } from '@shared/paragraphs.js';
 import {
   caretAtBlockStart,
+  deleteAcrossLines,
   flattenListToParagraphs,
   indentListItem,
   isEmptyListItem,
@@ -57,6 +110,7 @@ import {
   liftItemOutOfItem,
   outdentListItem,
   mergeParagraphIntoList,
+  settleEmptiedItems,
   parentListItem,
   unbulletListItems,
 } from './listEditing.js';
@@ -80,6 +134,7 @@ import type { ImportedAsset } from '@shared/ipc.js';
 import { commentFocus, commentHighlightsShown, onCommentHighlightsChange, openComments } from './comments.js';
 import { openThreadCount } from '@shared/comments.js';
 import { reportRenderDivergences } from './renderInvariants.js';
+import { OffSlideText } from './offSlideText.js';
 import { SpellingSession } from './spellcheck.js';
 
 /** A row of the canvas right-click menu. */
@@ -89,7 +144,12 @@ type ContextMenuEntry =
   | 'separator';
 import { isWebBridgeAction } from '@shared/webBridge.js';
 import { reportSelectionViolations } from './selectionInvariants.js';
+import { COMPARE_CHIP_CLASS, compareChip } from './compareChip.js';
 import { KeptSelectionHighlight, TEXT_EDIT_PANEL_CHROME } from './keptSelection.js';
+import { rangeForBookmark, textBookmark, type TextBookmark } from './caretPath.js';
+import { prepareCodeBlocks, syncCodeBody } from '../player/codeRender.js';
+import { CODE_EDIT_CHROME, CodeEditor } from './codeEditing.js';
+import { CODE_LINE_HEIGHT, CODE_PADDING_EM, describeLines, isLineBuild } from '@shared/codeBlocks.js';
 import {
   HANDLES,
   type SizeGuide,
@@ -102,6 +162,7 @@ import {
   spacingGuides,
 } from './snapping.js';
 import { sameSlideDrawing, type EditorStore } from './store.js';
+import { deleteTableRows, insertTableRow } from './tableRows.js';
 
 export type TableSelection = {
   elementId: string;
@@ -119,6 +180,8 @@ export type TableSelection = {
 type TableBorderEdge = 'top' | 'right' | 'bottom' | 'left';
 export type TableBorderPreset = 'none' | 'vertical' | 'horizontal';
 export type TableBorderSettings = { color: string; width: number; drawing: boolean };
+/** A block property the selected paragraphs share (null: none declares it), or mixed. */
+export type SelectionBlockValue = { mixed: boolean; value: number | null };
 
 /**
  * The editing surface: the slide rendered by the player, with an interaction
@@ -384,6 +447,8 @@ function findTextTarget(
 }
 
 const TEXT_BLOCKS = 'td, th, li, p, h1, h2, h3, h4, h5, h6, blockquote, div';
+/** The paragraphs outside a list that the Indent buttons step in and out. */
+const INDENTABLE_BLOCKS = 'p, h1, h2, h3, h4, h5, h6, blockquote, div';
 
 /**
  * Whether a range reaches across two blocks of the edited text.
@@ -420,6 +485,30 @@ function deleteSentinels(texts: Iterable<Text>): void {
       text.deleteData(at, TYPING_STYLE_SENTINEL.length);
     }
   }
+}
+
+/**
+ * Keep a pending run's sentinel in a text node of its own, apart from what is
+ * typed into the run.
+ *
+ * The caret of a pending run sits just before the sentinel, so each typed
+ * character lands in the sentinel's text node, right in front of it. Safari
+ * shapes a text node with Core Text, which folds an invisible U+2060 into the
+ * cluster of the letter before it, and WebKit draws a caret inside a cluster
+ * an even share of its width along: the caret stood in the middle of the
+ * letter just typed (Cmd+I, type, Cmd+I, type -- Nov 2026). Text in different
+ * nodes is never shaped together, so a sentinel alone in its node is a
+ * zero-width cluster of its own. Chromium shapes it apart either way.
+ */
+function isolateTypingSentinel(selection: Selection | null): void {
+  const node = selection?.rangeCount ? selection.getRangeAt(0).startContainer : null;
+  if (!(node instanceof Text) || !node.parentElement?.closest('[data-editor-typing-style]')) return;
+  const at = node.data.indexOf(TYPING_STYLE_SENTINEL);
+  if (at < 0 || node.data === TYPING_STYLE_SENTINEL) return;
+  // splitText moves a live caret past the split point into the new node and
+  // leaves one at it where it was, so the caret keeps its place.
+  const sentinel = at > 0 ? node.splitText(at) : node;
+  if (sentinel.data.length > TYPING_STYLE_SENTINEL.length) sentinel.splitText(TYPING_STYLE_SENTINEL.length);
 }
 
 function textNodesIn(root: Node): Text[] {
@@ -565,6 +654,19 @@ function relativeRunFontSize(text: Text, root: HTMLElement): string | null {
 function leafTextBlocks(root: HTMLElement): HTMLElement[] {
   return [...root.querySelectorAll<HTMLElement>('p, li, div')]
     .filter((block) => !block.querySelector('p, li, div'));
+}
+
+/**
+ * What the selected paragraphs declare for one block property, NaN where a
+ * paragraph declares nothing. A paragraph spaced 2 beside one that follows
+ * the box is mixed, not "follows the box": reported as the latter, the field
+ * showed the 2 it computed at the caret, and typing 2 there changed nothing,
+ * so the plain paragraph never took it (nightly seed 20261031).
+ */
+function sharedBlockValue(values: number[]): SelectionBlockValue {
+  const declared = values.map((value) => (Number.isFinite(value) ? value : null));
+  const mixed = !declared.every((value) => value === declared[0]);
+  return { mixed, value: mixed ? null : declared[0] };
 }
 
 /**
@@ -764,6 +866,8 @@ type ResizeOrigin = Rect & {
    * proportions, and is put back if Shift is let go mid-drag. */
   fit?: 'cover' | 'contain' | 'fill';
   control?: { x: number; y: number } | null;
+  /** A path drawn one unit to the pixel, which a resize redraws at the new size. */
+  path?: string;
 };
 
 type DragMode =
@@ -809,7 +913,40 @@ type DragMode =
     }
   | { kind: 'curve-control'; elementId: string }
   | { kind: 'brace-tip'; elementId: string }
-  | { kind: 'polygon-corner'; elementId: string; index: number };
+  | { kind: 'polygon-corner'; elementId: string; index: number }
+  | {
+      /** A point of the path being edited, or one of its handles (`which`). */
+      kind: 'path-point';
+      elementId: string;
+      sub: number;
+      index: number;
+      which: 'anchor' | 'in' | 'out';
+      startCanvas: XY;
+      /** The shape as it was when the drag began; every move starts from it. */
+      origin: ShapeEl;
+    }
+  | {
+      /**
+       * Bending the outline of the line or path being edited (Cmd/Ctrl-drag):
+       * the point at `t` on segment `segment` of run `sub` follows the pointer.
+       */
+      kind: 'path-bend';
+      elementId: string;
+      sub: number;
+      segment: number;
+      t: number;
+      /** Where on the outline the press landed. */
+      through: XY;
+      startCanvas: XY;
+      origin: ShapeEl;
+    };
+
+/**
+ * The canvas whose pen or point editing began last. The keys those modes
+ * answer are read from the window, and the Design workspace puts a second
+ * canvas on screen over the first; only this one answers them.
+ */
+let pathKeysOwner: EditorCanvas | null = null;
 
 /** Fired on the canvas host with a message (`detail`) for the shell's status bar. */
 export const CANVAS_NOTICE_EVENT = 'deckwerk-canvas-notice';
@@ -817,9 +954,15 @@ export const CANVAS_NOTICE_EVENT = 'deckwerk-canvas-notice';
 export class EditorCanvas {
   private store: EditorStore;
   private host: HTMLElement;
+  /** Typing into a code block on the slide (codeEditing.ts). */
+  private codeEditor: CodeEditor;
   private stage: HTMLElement;
   private slideLayer: HTMLElement;
   private overlay: HTMLElement;
+  /** Off-slide text recoloured to read on the pasteboard; see offSlideText.ts. */
+  private offSlideText: OffSlideText;
+  /** The comparison chip last drawn in the overlay (compareChip.ts). */
+  private compareChipNode: HTMLElement | null = null;
   private zoomInput: HTMLInputElement;
   private tableHeightSyncPending = false;
   /** Content-size passes run since the last frame; see scheduleTableHeightSync. */
@@ -837,6 +980,12 @@ export class EditorCanvas {
   private spacePan = false;
   /** Height of chrome covering the bottom of the host; see setBottomInset. */
   private bottomInset = 0;
+  /** Thickness of the rulers along the top and left of the host; see setRulerInset. */
+  private rulerInset = 0;
+  /** Where `rescale` last put the stage's top-left corner, in host pixels. */
+  private stageOrigin = { left: 0, top: 0 };
+  private viewportListeners = new Set<() => void>();
+  private zoomControls: HTMLElement;
   private drag: DragMode = { kind: 'none' };
   /**
    * Whether the pointer has moved far enough to count as a drag.
@@ -929,7 +1078,7 @@ export class EditorCanvas {
   /** Re-enter this edit after a rebuild that was forced mid-session. */
   private pendingEditReentry: {
     elementId: string;
-    offsets: { start: number; end: number } | null;
+    bookmark: TextBookmark | null;
   } | null = null;
   /**
    * What a discarded session reverts to: the session-start html, moved
@@ -1017,6 +1166,15 @@ export class EditorCanvas {
    * native event alone left double-click-to-play inert there.
    */
   private pendingMediaToggle: string | null = null;
+  /** Where the press that may open a code block's edit landed, for its caret. */
+  private pendingCodePoint: { clientX: number; clientY: number } | null = null;
+  /**
+   * A line or path whose points open when this press is let go without a
+   * drag: the second press of a double-click on it, read from the presses
+   * because the selection chrome drawn by the first lands under the pointer
+   * and Chromium then fires no dblclick at all.
+   */
+  private pendingPathEdit: string | null = null;
   /** When the pointer path last toggled media, so the native dblclick skips. */
   private mediaToggledAt = Number.NEGATIVE_INFINITY;
 
@@ -1030,8 +1188,40 @@ export class EditorCanvas {
    */
   private maskingId: string | null = null;
   private buildBadgesVisible = false;
+  /** The Build panel's preview, laid over the slide while it plays; see beginPlayback. */
+  private playback: { shield: HTMLElement; frame: HTMLElement } | null = null;
   /** The crop as it was when the current mask drag began. */
   private maskOrigin: { x: number; y: number; w: number; h: number } | null = null;
+  /**
+   * The pen's drawing in progress (Shape → Draw with Pen). While there is one,
+   * every press on the canvas places a point; the deck changes only when the
+   * drawing is finished, as one new path shape.
+   */
+  private pen: PenDraft | null = null;
+  /**
+   * When the pen last finished an open line with a double-click. That
+   * gesture's own `dblclick` arrives afterwards and lands on the new path,
+   * where it would open its points for editing.
+   */
+  private penFinishedAt = Number.NEGATIVE_INFINITY;
+  /**
+   * The pencil, while it is out (Pen ▾ → Pencil, or Shift+P): the slide it
+   * draws on and the stroke under the pointer, in canvas coordinates. Each
+   * stroke becomes its own path when the pointer lifts, and the pencil stays
+   * out for the next one until Escape, Return or the button puts it down.
+   */
+  private pencil: { slideId: string; stroke: XY[] | null } | null = null;
+  /** Notified when the pen or the pencil is taken up or put down, so the toolbar can show it. */
+  onPenToolChange?: (tool: DrawingTool | null) => void;
+  /**
+   * The path shape whose points are being edited (double-click a path, or
+   * Edit points), and which of its points is selected: `sub` is the run,
+   * `index` the point in it. Like mask mode, this is the canvas's own state;
+   * the deck changes only as points are dragged, added and deleted.
+   */
+  private pathEdit: { elementId: string; point: { sub: number; index: number } | null } | null = null;
+  /** Notified when point editing starts or ends, so the inspector can relabel. */
+  onPathEditChange?: (elementId: string | null) => void;
 
   /** Notified when mask mode turns on or off, so the inspector can relabel. */
   onMaskModeChange?: (elementId: string | null) => void;
@@ -1060,6 +1250,16 @@ export class EditorCanvas {
   constructor(host: HTMLElement, store: EditorStore) {
     this.host = host;
     this.store = store;
+    this.codeEditor = new CodeEditor({
+      store,
+      chrome: host,
+      nodeFor: (id) => this.slideLayer.querySelector<HTMLElement>(`[data-element-id="${CSS.escape(id)}"]`),
+      redrawOverlay: () => {
+        const { deck, slideIndex, selection } = this.store.get();
+        const slide = deck.slides[slideIndex];
+        if (slide) this.drawOverlay(deck, slide.elements, selection);
+      },
+    });
 
     this.host.classList.add('canvas-host');
     this.stage = document.createElement('div');
@@ -1068,10 +1268,11 @@ export class EditorCanvas {
     this.slideLayer.className = 'slide-layer';
     this.overlay = document.createElement('div');
     this.overlay.className = 'overlay-layer';
-    this.stage.append(this.slideLayer, this.overlay);
-    const zoomControls = this.createZoomControls();
-    this.zoomInput = zoomControls.querySelector<HTMLInputElement>('.zoom-value')!;
-    this.host.replaceChildren(this.stage, zoomControls);
+    this.offSlideText = new OffSlideText(this.slideLayer, this.host);
+    this.stage.append(this.slideLayer, this.offSlideText.layer, this.overlay);
+    this.zoomControls = this.createZoomControls();
+    this.zoomInput = this.zoomControls.querySelector<HTMLInputElement>('.zoom-value')!;
+    this.host.replaceChildren(this.stage, this.zoomControls);
 
     new ResizeObserver(() => this.rescale()).observe(this.host);
     this.bindPointer();
@@ -1121,11 +1322,33 @@ export class EditorCanvas {
    * test for "did the content change".
    */
   render(): void {
+    this.renderSlide();
+    // A code block being typed into keeps its draft across the redraw.
+    this.codeEditor.afterRender();
+  }
+
+  private renderSlide(): void {
     // A render can replace the edited box's nodes out from under the
     // bookmark, or end the edit: either way the kept highlight is re-derived.
     this.keptSelection.schedule();
     const { deck, slideIndex, selection } = this.store.get();
     const slide = deck.slides[slideIndex];
+    // A drawing belongs to the slide it was begun on, and selecting anything
+    // (a click in the rail, a new text box) puts the pen down.
+    if (this.pen && (this.pen.slideId !== slide?.id || selection.size > 0)) this.endPen();
+    if (this.pencil && (this.pencil.slideId !== slide?.id || selection.size > 0)) this.endPencil();
+    // Point editing ends when its path stops being the one selected object:
+    // another selection, a slide change, an undo that took the path away.
+    if (this.pathEdit) {
+      const edited = slide?.elements.find((el) => el.id === this.pathEdit!.elementId);
+      const paths = edited ? editableRuns(edited) : null;
+      if (!paths || selection.size !== 1 || !selection.has(edited!.id)) {
+        this.pathEdit = null;
+        this.onPathEditChange?.(null);
+      } else if (this.pathEdit.point && !paths[this.pathEdit.point.sub]?.nodes[this.pathEdit.point.index]) {
+        this.pathEdit.point = null;
+      }
+    }
     if (!slide) {
       this.slideLayer.replaceChildren();
       this.overlay.replaceChildren();
@@ -1187,7 +1410,11 @@ export class EditorCanvas {
         {
           context: 'an in-place patch',
           // Live pages deliberately differ from the preview render.
-          skipElementIds: [...(this.editingId ? [this.editingId] : []), ...this.liveWebIds],
+          skipElementIds: [
+            ...(this.editingId ? [this.editingId] : []),
+            ...(this.codeEditor.editingId() ? [this.codeEditor.editingId()!] : []),
+            ...this.liveWebIds,
+          ],
         },
       );
       this.scheduleTableHeightSync();
@@ -1214,7 +1441,7 @@ export class EditorCanvas {
     if (this.editingId) {
       this.pendingEditReentry = {
         elementId: this.editingId,
-        offsets: this.editingSelectionOffsets(),
+        bookmark: this.editingSelectionBookmark(),
       };
       if (this.finishTextEdit) this.finishTextEdit(true);
       else this.commitTextEdit();
@@ -1236,9 +1463,11 @@ export class EditorCanvas {
     }
 
     this.harvestVideos();
+    prepareCodeBlocks(this.store.get().deck);
     const rendered = renderSlide(
       slide,
-      { resolveSrc: (src) => window.api.assetUrl(src), mediaPreload: 'metadata' },
+      // A slide being stepped to shows at once, its pictures as they decode.
+      { resolveSrc: (src) => window.api.assetUrl(src), mediaPreload: 'metadata', decodeImagesAsync: slideChanged },
     );
     if (slideChanged) this.adoptWarmedImages(rendered);
     this.slideLayer.replaceChildren(rendered);
@@ -1293,8 +1522,11 @@ export class EditorCanvas {
     const el = slide?.elements.find((candidate) => candidate.id === pending.elementId);
     if (!el || (el.type !== 'text' && el.type !== 'html')) return;
     this.beginTextEdit(pending.elementId);
-    if (this.editingId === pending.elementId && pending.offsets) {
-      this.restoreEditingSelection(pending.offsets);
+    if (this.editingId === pending.elementId && pending.bookmark) {
+      const body = this.slideLayer.querySelector<HTMLElement>(
+        `[data-element-id="${CSS.escape(pending.elementId)}"] .text-content`,
+      );
+      if (body) this.restoreTextBookmark(body, pending.bookmark);
     }
   }
 
@@ -1497,6 +1729,58 @@ export class EditorCanvas {
   }
 
   /**
+   * Draw the slide again from nothing. For files that arrived after the slide
+   * was drawn without them (a collaborator's new picture reaching this
+   * machine's copy of a server deck): an unchanged slide is otherwise never
+   * rebuilt, so its broken picture would stay broken.
+   */
+  forceRedraw(): void {
+    this.renderedSlide = null;
+    this.renderedSlideIndex = null;
+    this.render();
+  }
+
+  /**
+   * Move paused clips onto the variant the server now names for them.
+   *
+   * A clip's streaming version can land while the canvas shows its original:
+   * the server announces it, and every URL built for the clip from then on
+   * asks for the version. An element already built keeps its URL, and a
+   * paused one goes on reading the original as far ahead as the browser
+   * buffers — 16 MB of a 30 MB recording after its 6 MB version existed. So
+   * each paused element is rebuilt on the new URL, which cancels the old
+   * fetch, and pooled elements built for the old URL are released. A playing
+   * clip keeps its bytes: swapping them under a playing element is the
+   * PIPELINE_ERROR_DECODE the variant pins exist to prevent.
+   *
+   * An element that showed only its still while the clip waited for that
+   * version (videoMemory.ts) is rebuilt too, now that there is something to
+   * read.
+   */
+  refreshMediaSources(srcs: Iterable<string>): void {
+    const resolveSrc = (src: string) => window.api.assetUrl(src);
+    const changed = new Set(srcs);
+    if (changed.size === 0) return;
+    const outdated = (video: HTMLVideoElement) => {
+      const src = video.dataset.assetSrc;
+      if (!src || !changed.has(src)) return false;
+      return video.dataset.streamPending === 'true' || videoNetworkSrc(video) !== resolveSrc(src);
+    };
+    this.videoPool.releaseWhere(outdated);
+    for (const el of this.store.slide?.elements ?? []) {
+      if (el.type !== 'video') continue;
+      const video = this.videoNode(el.id);
+      if (!video || !video.paused || !outdated(video)) continue;
+      const fresh = renderElement(el, { resolveSrc, mediaPreload: 'metadata' }).querySelector('video');
+      if (!fresh) continue;
+      fresh.removeAttribute('autoplay');
+      video.replaceWith(fresh);
+      ungateVideoLoad(video);
+      releaseDecodedVideo(video);
+    }
+  }
+
+  /**
    * Move the outgoing slide's decoded videos into the pool before the layer is
    * torn down, so the next render of the same media paints instantly.
    */
@@ -1600,7 +1884,12 @@ export class EditorCanvas {
    * the other person's words. Either way the caret is carried through the
    * change by what was inserted or removed before it, not left at the same
    * numeric offset, which dropped the next keystrokes into the middle of the
-   * other person's word.
+   * other person's word — and by the block it is in (caretPath.ts), so it
+   * stays in its own bullet, an empty one included.
+   *
+   * Html that differs from the sync point only in how it is spelled (this
+   * session's own push coming back normalised, a tool re-serialising the
+   * box) changes nothing here: the live DOM is not touched at all.
    */
   private adoptRemoteEditedHtml(
     el: SlideElement & { type: 'text' | 'html' },
@@ -1628,29 +1917,28 @@ export class EditorCanvas {
       this.textEditStoreBase = el.html;
       return;
     }
-    const remote = local === domBase ? null : editingFormOf(el.html);
+    const incoming = editingFormOf(el.html);
+    if (incoming === domBase || incoming === editingFormOf(this.textEditStoreBase)) {
+      // The same content in another spelling — this session's own commit
+      // echoed back through the server, normalised on the way. The live DOM
+      // and the caret in it already are that content: nothing to do.
+      this.textEditStoreBase = el.html;
+      return;
+    }
+    const remote = local === domBase ? null : incoming;
     const merged = remote === null ? null : mergeTextHtml(domBase, remote, local);
     if (merged !== local) {
+      // Carried by block and offset within it, not by one flat offset: a
+      // flat offset cannot tell an empty bullet from the end of the bullet
+      // above or the start of the one below, and the caret jumped there.
       const range = this.activeTextRange(body);
-      const offsets = range ? this.textOffsetsForRange(body, range) : null;
-      // Flat text offsets cannot tell the end of one paragraph from the start
-      // of the next; a caret that sat at the end of its text stays there.
-      const affinity = range?.collapsed && range.startContainer instanceof Text
-        && range.startOffset > 0 && range.startOffset === range.startContainer.data.length
-        ? 'backward' : 'forward';
-      const before = body.textContent ?? '';
+      const bookmark = range ? textBookmark(body, TEXT_BLOCKS, range) : null;
       // A peer can send legacy generated KaTeX just as the session can start
       // with it; keep the live editing surface in authored delimiter form.
       body.innerHTML = merged === null
         ? normalizeParagraphHtml(restoreKatexSourceHtml(el.html), true)
         : normalizeParagraphHtml(merged, true);
-      if (offsets) {
-        const after = body.textContent ?? '';
-        this.restoreTextRange(body, {
-          start: mapTextOffset(before, after, offsets.start),
-          end: mapTextOffset(before, after, offsets.end),
-        }, affinity);
-      }
+      if (bookmark) this.restoreTextBookmark(body, bookmark);
     }
     this.textEditStoreBase = el.html;
     if (remote === null) {
@@ -1671,6 +1959,8 @@ export class EditorCanvas {
     const resolve = { resolveSrc: (src: string) => window.api.assetUrl(src) };
     const rendered = this.slideLayer.querySelector<HTMLElement>(':scope > .slide');
     if (rendered) applySlideRootStyles(rendered, slide, resolve);
+    // A theme change can take this path; the Deck code scheme follows it.
+    prepareCodeBlocks(this.store.get().deck);
 
     for (const el of slide.elements) {
       const node = this.slideLayer.querySelector<HTMLElement>(
@@ -1697,6 +1987,8 @@ export class EditorCanvas {
       // A shape's drawing is sized by its own viewBox, so the wrapper's new
       // box is not enough: rebuild the SVG for the current geometry.
       if (el.type === 'shape') syncShapeBody(node, el);
+      // A code block's lines are drawn from its fields; redraw when they change.
+      if (el.type === 'code') syncCodeBody(node, el);
     }
   }
 
@@ -1714,6 +2006,8 @@ export class EditorCanvas {
     const video = this.videoNode(elementId);
     if (!video) return false;
     if (video.paused) {
+      // An element showing only its still has nothing to play yet.
+      startVideoSource(video);
       // The editor preview honours the trim exactly as the player does:
       // start at the in point, loop back to it at the out point.
       const el = this.store.slide?.elements.find((e) => e.id === elementId);
@@ -1752,6 +2046,7 @@ export class EditorCanvas {
   seekVideo(elementId: string, time: number): void {
     const video = this.videoNode(elementId);
     if (!video) return;
+    startVideoSource(video);
     video.pause();
     const t = Math.max(0, time);
     // Seeking before metadata arrives is silently ignored by the browser, so
@@ -1796,10 +2091,53 @@ export class EditorCanvas {
     setStyle(this.stage, 'transform', `scale(${scale})`);
     setStyle(this.stage, '--editor-inv-scale', String(1 / scale));
     setStyle(this.stage, 'transform-origin', 'top left');
-    setStyle(this.stage, 'left', `${(r.width - deck.canvas.w * scale) / 2 + this.pan.x}px`);
-    setStyle(this.stage, 'top', `${(r.height - deck.canvas.h * scale) / 2 + this.pan.y}px`);
+    // The viewport starts below and right of the rulers, when they are shown.
+    this.stageOrigin = {
+      left: this.rulerInset + (r.width - deck.canvas.w * scale) / 2 + this.pan.x,
+      top: this.rulerInset + (r.height - deck.canvas.h * scale) / 2 + this.pan.y,
+    };
+    setStyle(this.stage, 'left', `${this.stageOrigin.left}px`);
+    setStyle(this.stage, 'top', `${this.stageOrigin.top}px`);
     this.syncZoomInput();
+    this.placePlayback();
     this.onViewportChange?.();
+    for (const listener of this.viewportListeners) listener();
+    this.codeEditor?.reposition();
+  }
+
+  /**
+   * Where slide space sits in the host: the host-pixel position of the
+   * slide's top-left corner, and host pixels per slide unit. The rulers
+   * read their scale from this.
+   */
+  stagePlacement(): { left: number; top: number; scale: number } {
+    return { ...this.stageOrigin, scale: this.scale };
+  }
+
+  /**
+   * Called after every `rescale` -- zoom, pan, a resize, an inset. Unlike
+   * `onViewportChange`, which the collaboration shell's presence overlay
+   * owns, any number of listeners can watch.
+   */
+  addViewportListener(listener: () => void): () => void {
+    this.viewportListeners.add(listener);
+    return () => this.viewportListeners.delete(listener);
+  }
+
+  /** Put a view control (the rulers toggle) at the start of the zoom pill. */
+  addViewControl(control: HTMLElement): void {
+    this.zoomControls.prepend(control);
+  }
+
+  /**
+   * Reserve `px` along the top and left of the host for the rulers, so the
+   * slide is fitted and centred beside them rather than underneath.
+   */
+  setRulerInset(px: number): void {
+    const next = Math.max(0, px);
+    if (next === this.rulerInset) return;
+    this.rulerInset = next;
+    this.rescale();
   }
 
   /** User-visible zoom percentage, relative to the normal fitted view. */
@@ -1818,10 +2156,69 @@ export class EditorCanvas {
     this.rescale();
   }
 
-  /** The part of the host the slide is laid out in: the host, less any bottom inset. */
+  /**
+   * Lay a surface over the slide, at the same place and size and the current
+   * zoom, for the Build panel's preview to play it on; the slide and its
+   * selection chrome are hidden underneath until `end`. The surface lives
+   * outside the canvas host, so none of the editor's canvas styling (empty
+   * placeholders shown, table chrome) reaches what plays: it looks the way
+   * presenting does. A shield over the canvas takes every press meanwhile and
+   * reports it to `onPress`, so a click ends the preview without selecting.
+   */
+  beginPlayback(onPress: () => void): { surface: HTMLElement; end: () => void } {
+    const shield = document.createElement('div');
+    shield.className = 'build-preview-shield';
+    const frame = document.createElement('div');
+    frame.className = 'build-preview-frame';
+    shield.appendChild(frame);
+    shield.addEventListener('pointerdown', (event) => {
+      event.preventDefault();
+      onPress();
+    });
+    shield.addEventListener('wheel', (event) => event.preventDefault(), { passive: false });
+    shield.addEventListener('contextmenu', (event) => event.preventDefault());
+    document.body.appendChild(shield);
+    const playback = { shield, frame };
+    this.playback = playback;
+    this.host.classList.add('build-previewing');
+    this.placePlayback();
+    return {
+      surface: frame,
+      end: () => {
+        shield.remove();
+        if (this.playback !== playback) return;
+        this.playback = null;
+        this.host.classList.remove('build-previewing');
+      },
+    };
+  }
+
+  /** Keep the preview over the slide through a resize, zoom or pan. */
+  private placePlayback(): void {
+    if (!this.playback) return;
+    const { shield, frame } = this.playback;
+    const host = this.host.getBoundingClientRect();
+    const { canvas } = this.store.get().deck;
+    shield.style.left = `${host.left}px`;
+    shield.style.top = `${host.top}px`;
+    shield.style.width = `${host.width}px`;
+    shield.style.height = `${host.height}px`;
+    frame.style.left = this.stage.style.left;
+    frame.style.top = this.stage.style.top;
+    frame.style.width = `${canvas.w * this.scale}px`;
+    frame.style.height = `${canvas.h * this.scale}px`;
+  }
+
+  /** The part of the host the slide is laid out in: the host, less the rulers and any bottom inset. */
   private viewportRect(): { left: number; top: number; width: number; height: number } {
     const r = this.host.getBoundingClientRect();
-    return { left: r.left, top: r.top, width: r.width, height: Math.max(0, r.height - this.bottomInset) };
+    const inset = this.rulerInset;
+    return {
+      left: r.left + inset,
+      top: r.top + inset,
+      width: Math.max(0, r.width - inset),
+      height: Math.max(0, r.height - inset - this.bottomInset),
+    };
   }
 
   /** Set zoom around the viewport centre. Exposed for shell actions and tests. */
@@ -1956,7 +2353,8 @@ export class EditorCanvas {
 
   private bindViewportGestures(): void {
     this.host.addEventListener('wheel', (event) => {
-      if ((event.target as HTMLElement).closest('.zoom-controls, .notes-drawer')) return;
+      // Panels floating over the canvas scroll themselves; the slide stays put.
+      if ((event.target as HTMLElement).closest('.zoom-controls, .notes-drawer, .objects-drawer, .light-table')) return;
 
       // Chromium represents a macOS trackpad pinch as a wheel event with the
       // control modifier set, and a mouse wheel with Ctrl/Cmd held arrives
@@ -2041,7 +2439,7 @@ export class EditorCanvas {
   private beginViewportPan(ev: PointerEvent): boolean {
     if (ev.button !== 1 && !(ev.button === 0 && this.spacePan)) return false;
     const target = ev.target instanceof Element ? ev.target : null;
-    if (target?.closest('.welcome-screen, .zoom-controls, .notes-toggle, .notes-drawer')) return false;
+    if (target?.closest('.welcome-screen, .zoom-controls, .notes-toggle, .notes-drawer, .objects-toggle, .objects-drawer, .light-table')) return false;
     // No selection, no text selection, no focus change: a text box being
     // edited stays in its edit.
     ev.preventDefault();
@@ -2108,6 +2506,8 @@ export class EditorCanvas {
     elements: SlideElement[],
     selection: Set<string>,
   ): void {
+    // A code block being typed into is as tall as its draft, not its stored box.
+    elements = this.codeEditor.liveElements(elements);
     const frag = document.createDocumentFragment();
 
     // While the Build tab is open, number every element a build entry touches
@@ -2118,8 +2518,14 @@ export class EditorCanvas {
       // By-paragraph reveals get one badge per paragraph, pinned to the
       // paragraph's own line so each number matches its row in the panel.
       const paragraphNumbers = new Map<string, Array<{ part: number; num: number }>>();
+      // A code block's line builds get theirs beside the first line they act on.
+      const lineNumbers = new Map<string, Array<{ line: number; num: number }>>();
       (slide ? expandTimeline(slide) : []).forEach((unit, i) => {
-        if (unit.part !== null) {
+        if (slide && unit.action.lines && isLineBuild(unit, slide)) {
+          const list = lineNumbers.get(unit.action.target) ?? [];
+          list.push({ line: Number.parseInt(unit.action.lines, 10), num: i + 1 });
+          lineNumbers.set(unit.action.target, list);
+        } else if (unit.part !== null) {
           const list = paragraphNumbers.get(unit.action.target) ?? [];
           list.push({ part: unit.part, num: i + 1 });
           paragraphNumbers.set(unit.action.target, list);
@@ -2142,6 +2548,16 @@ export class EditorCanvas {
       for (const el of elements) {
         const numbers = numbersByElement.get(el.id);
         if (numbers) makeBadge(numbers.join(','), el.x + el.w, el.y);
+        const lineBuilds = lineNumbers.get(el.id);
+        if (lineBuilds) {
+          // Builds on the same line share one badge, as an object's do.
+          const byLine = new Map<number, number[]>();
+          for (const { line, num } of lineBuilds) byLine.set(line, [...(byLine.get(line) ?? []), num]);
+          for (const [line, nums] of byLine) {
+            const box = this.codeLineBox(el, line, line, stageRect);
+            makeBadge(nums.join(','), el.x + el.w, (box?.top ?? el.y) + 9);
+          }
+        }
         const parts = paragraphNumbers.get(el.id);
         if (!parts) continue;
         const content = this.stage.querySelector<HTMLElement>(
@@ -2201,11 +2617,32 @@ export class EditorCanvas {
       if (el && (el.type === 'image' || el.type === 'video') && el.sourceBox) {
         const ghost = document.createElement('div');
         ghost.className = 'mask-ghost';
-        ghost.style.left = `${el.x + el.sourceBox.x}px`;
-        ghost.style.top = `${el.y + el.sourceBox.y}px`;
+        // A flipped picture is drawn mirrored about the window's centre.
+        const { flipX, flipY } = flipsOf(el);
+        ghost.style.left = `${el.x + (flipX ? el.w - el.sourceBox.x - el.sourceBox.w : el.sourceBox.x)}px`;
+        ghost.style.top = `${el.y + (flipY ? el.h - el.sourceBox.y - el.sourceBox.h : el.sourceBox.y)}px`;
         ghost.style.width = `${el.sourceBox.w}px`;
         ghost.style.height = `${el.sourceBox.h}px`;
         frag.appendChild(ghost);
+      }
+    }
+
+    // Lines picked in a code block's gutter, for a build on just those lines.
+    const picked = this.store.codeLineSelection();
+    if (picked && this.codeEditor.editingId() !== picked.elementId) {
+      const el = elements.find((candidate) => candidate.id === picked.elementId);
+      const box = el ? this.codeLineBox(el, picked.from, picked.to, this.stage.getBoundingClientRect()) : null;
+      if (el && box) {
+        const mark = document.createElement('div');
+        mark.className = 'code-line-pick';
+        mark.style.left = `${el.x}px`;
+        mark.style.top = `${box.top}px`;
+        mark.style.width = `${el.w}px`;
+        mark.style.height = `${box.height}px`;
+        mark.style.setProperty('--inv', String(1 / this.scale));
+        mark.dataset.lines = `${picked.from}-${picked.to}`;
+        mark.title = describeLines(Array.from({ length: picked.to - picked.from + 1 }, (_, i) => picked.from + i));
+        frag.appendChild(mark);
       }
     }
 
@@ -2228,6 +2665,14 @@ export class EditorCanvas {
       if (el.rot && !isLine) box.style.transform = `rotate(${el.rot}deg)`;
       // Counter-scale so outlines and handles stay one visual size at any zoom.
       box.style.setProperty('--inv', String(1 / this.scale));
+
+      // A path whose points are being edited shows those instead of its box
+      // (drawn below, over everything else).
+      if (this.pathEdit?.elementId === el.id) {
+        box.classList.add('path-editing');
+        frag.appendChild(box);
+        continue;
+      }
 
       // Lines, arrows and braces get endpoint handles instead of a resize
       // box: what you want to move is where the arrow starts and ends, not
@@ -2319,7 +2764,8 @@ export class EditorCanvas {
       }
       if (selection.size === 1) {
         // A straight-sided shape offers its corners. The box is rotated with
-        // the element, so corners are placed in its own unrotated frame.
+        // the element but never flipped (its handles are symmetric), so
+        // corners are placed in its own unrotated frame, mirrored by its flips.
         const corners = el.type === 'shape' ? polygonPoints(el) : null;
         if (corners && el.type === 'shape') {
           const size = el.pathSize ?? { w: el.w, h: el.h };
@@ -2329,8 +2775,9 @@ export class EditorCanvas {
             h.dataset.corner = String(index);
             h.dataset.elementId = el.id;
             h.title = 'Drag to move this corner';
-            h.style.left = `${(corner.x / size.w) * el.w}px`;
-            h.style.top = `${(corner.y / size.h) * el.h}px`;
+            const at = flipped(el, { x: (corner.x / size.w) * el.w, y: (corner.y / size.h) * el.h });
+            h.style.left = `${at.x}px`;
+            h.style.top = `${at.y}px`;
             h.style.margin = '0';
             box.appendChild(h);
           });
@@ -2344,13 +2791,29 @@ export class EditorCanvas {
             divider.className = 'table-column-resize-handle';
             divider.dataset.tableColumn = String(column);
             divider.dataset.elementId = el.id;
-            divider.style.left = `${offset / total * 100}%`;
+            const at = offset / total * 100;
+            divider.style.left = `${flipsOf(el).flipX ? 100 - at : at}%`;
             box.appendChild(divider);
           });
         }
       }
       frag.appendChild(box);
     }
+
+    // Two pictures selected: the way into a before/after wipe, or the length
+    // of the one they already are; out of the way while anything is dragged
+    // or edited. The same chip stays in the overlay, never detached, while it
+    // would draw the same: a pointer-up redraws the overlay, and a button
+    // taken out of the document between its press and release gets no click.
+    const chip = this.drag.kind === 'none' && !this.editingId && !this.maskingId
+      ? compareChip(this.store, elements, selection, deck.canvas, this.scale)
+      : null;
+    const drawn = this.compareChipNode;
+    const keptChip = chip && drawn?.parentNode === this.overlay && drawn.dataset.key === chip.dataset.key
+      ? drawn
+      : null;
+    this.compareChipNode = keptChip ?? chip;
+    if (chip && !keptChip) frag.appendChild(chip);
 
     for (const g of this.guides) {
       const line = document.createElement('div');
@@ -2405,6 +2868,16 @@ export class EditorCanvas {
       }
     }
 
+    if (this.pen) frag.appendChild(penOverlay(this.pen, this.scale, deck.canvas));
+    if (this.pencil?.stroke) {
+      frag.appendChild(pencilOverlay(this.pencil.stroke, newObjectColors(deck).stroke, deck.canvas));
+    }
+    if (this.pathEdit) {
+      const edited = elements.find((el) => el.id === this.pathEdit!.elementId);
+      const paths = edited ? editableRuns(edited) : null;
+      if (edited && paths) frag.appendChild(this.pathEditOverlay(edited.id, paths, deck));
+    }
+
     if (this.marquee) {
       const m = document.createElement('div');
       m.className = 'marquee';
@@ -2415,7 +2888,12 @@ export class EditorCanvas {
       frag.appendChild(m);
     }
 
-    this.overlay.replaceChildren(frag);
+    if (keptChip) {
+      for (const child of [...this.overlay.childNodes]) if (child !== keptChip) child.remove();
+      this.overlay.insertBefore(frag, keptChip);
+    } else {
+      this.overlay.replaceChildren(frag);
+    }
 
     // In development, verify that everything the editor believes about
     // selection agrees with everything it just drew. The reporter settles
@@ -2429,6 +2907,7 @@ export class EditorCanvas {
         slideSelection: state.slideSelection,
         editingId: this.editingId,
         maskingId: this.maskingId,
+        pathEditId: this.pathEdit?.elementId ?? null,
         tableSelection: this.tableSelection,
         slideLayer: this.slideLayer,
         overlay: this.overlay,
@@ -2476,6 +2955,10 @@ export class EditorCanvas {
     document.fonts?.addEventListener?.('loadingdone', () => this.scheduleTableHeightSync());
     this.host.addEventListener('contextmenu', (ev) => this.onContextMenu(ev));
 
+    // Ahead of the shell's own shortcuts: while the pen is drawing, Return,
+    // Escape, Backspace and undo belong to the drawing; while a path's points
+    // are being edited, Delete removes a point and Escape or Return is done.
+    window.addEventListener('keydown', (ev) => this.onPathKey(ev), true);
     // Modifier state changes do not cause pointermove, so mirror the gesture
     // modifier onto the canvas host to let CSS swap the handle cursor while it
     // is hovered.
@@ -2530,7 +3013,7 @@ export class EditorCanvas {
     // are ordinary application controls. Capturing their pointer on the canvas
     // changes the pointer-up target and prevents Chromium from synthesising a
     // click, which made all three welcome actions appear inert.
-    if (target.closest('.welcome-screen, .zoom-controls, .notes-toggle, .notes-drawer')) return;
+    if (target.closest(`.welcome-screen, .zoom-controls, .notes-toggle, .notes-drawer, .objects-toggle, .objects-drawer, .light-table, .canvas-ruler, .${COMPARE_CHIP_CLASS}, .${CODE_EDIT_CHROME}`)) return;
     const slide = this.store.slide;
     if (!slide) return;
     // A press that reaches the canvas was not on a live page (the frame keeps
@@ -2566,6 +3049,16 @@ export class EditorCanvas {
     this.onPointerSample?.(point);
     this.host.setPointerCapture(ev.pointerId);
 
+    if (this.pen) {
+      this.penPointerDown(ev, point, secondClick);
+      return;
+    }
+    if (this.pencil) {
+      this.pencil.stroke = [point];
+      this.redrawOverlay();
+      return;
+    }
+
     // A click away from the active crop window is the implicit "Done" action.
     // Keep the click alive after leaving mask mode so it can still select the
     // object underneath (or begin a marquee on empty canvas). Mask handles are
@@ -2584,6 +3077,8 @@ export class EditorCanvas {
         this.toggleMaskMode(null);
       }
     }
+
+    if (this.pathEdit && this.pathEditPointerDown(ev, target, point, secondClick)) return;
 
     // Like Keynote, the gesture modifier (Command on macOS, Control elsewhere)
     // turns any ordinary object handle into a rotation handle. Curve controls
@@ -2711,6 +3206,9 @@ export class EditorCanvas {
             ...((selected.type === 'shape' && selected.control)
               ? { control: { ...selected.control } }
               : {}),
+            ...((selected.type === 'shape' && drawnAtPixelScale(selected))
+              ? { path: selected.path! }
+              : {}),
           });
         }
         this.drag = {
@@ -2753,6 +3251,19 @@ export class EditorCanvas {
 
     // Topmost element under the cursor wins, matching what you see.
     const hit = this.hitTest(point);
+    // A selected code block's gutter picks lines rather than moving the
+    // block: a click takes one line, Shift-click stretches to it.
+    if (hit?.type === 'code' && !ev.altKey && !commandModifier(ev)) {
+      const selected = this.store.get().selection;
+      const line = selected.size === 1 && selected.has(hit.id) ? this.codeGutterLine(hit.id, ev) : null;
+      if (line !== null) {
+        this.store.selectCodeLines(hit.id, line, ev.shiftKey);
+        // Two quick gutter clicks are two picks, never a way into the code.
+        this.lastContentClick = null;
+        return;
+      }
+      if (!ev.shiftKey) this.store.clearCodeLines();
+    }
     if (hit) {
       const selection = this.store.get().selection;
       this.pendingTextEdit = !ev.shiftKey
@@ -2761,9 +3272,11 @@ export class EditorCanvas {
         ? { elementId: hit.id, clientX: ev.clientX, clientY: ev.clientY, selectWord: secondClick }
         : null;
       this.pendingMediaToggle = secondClick && !ev.shiftKey
-        && (hit.type === 'video' || hit.type === 'web' || hit.type === 'image')
+        && (hit.type === 'video' || hit.type === 'web' || hit.type === 'image' || hit.type === 'code')
         ? hit.id
         : null;
+      this.pendingCodePoint = hit.type === 'code' ? { clientX: ev.clientX, clientY: ev.clientY } : null;
+      this.pendingPathEdit = secondClick && !ev.shiftKey && isLineFamily(hit) ? hit.id : null;
       if (!selection.has(hit.id)) {
         this.store.select([hit.id], ev.shiftKey);
       } else if (ev.shiftKey) {
@@ -2789,6 +3302,24 @@ export class EditorCanvas {
     // Presence: report the pointer in slide space whether hovering or
     // dragging, so collaborators see the cursor move, not only the edits.
     this.onPointerSample?.(this.toCanvas(ev));
+    if (this.pen) {
+      // Hovering moves the preview; with the button down, the press pulls
+      // out the new point's handles.
+      this.pen.move(wholePixel(this.toCanvas(ev)), ev.shiftKey, DRAG_THRESHOLD_PX / this.scale);
+      this.redrawOverlay();
+      return;
+    }
+    if (this.pencil) {
+      const stroke = this.pencil.stroke;
+      if (stroke && !isHoverMove(ev)) {
+        // Every sample the pointer reported since the last frame, so a quick
+        // stroke keeps its shape.
+        const samples = ev.getCoalescedEvents?.() ?? [];
+        for (const sample of samples.length > 0 ? samples : [ev]) stroke.push(this.toCanvas(sample));
+        this.redrawOverlay();
+      }
+      return;
+    }
     if (this.drag.kind === 'none') return;
     // Only a held button drags. See `isHoverMove`.
     if (isHoverMove(ev)) return;
@@ -2909,6 +3440,10 @@ export class EditorCanvas {
           dx = rx;
           dy = ry;
         }
+        // And a flipped one's picture is drawn mirrored, so it moves the other way.
+        const flips = flipsOf(target);
+        if (flips.flipX) dx = -dx;
+        if (flips.flipY) dy = -dy;
         // Shift constrains to the dominant axis, as everywhere else.
         if (ev.shiftKey) {
           if (Math.abs(dx) > Math.abs(dy)) dy = 0;
@@ -2936,9 +3471,11 @@ export class EditorCanvas {
         const radians = element.rot * Math.PI / 180;
         const canvasDx = point.x - drag.startCanvas.x;
         const canvasDy = point.y - drag.startCanvas.y;
-        const dx = radians
+        const along = radians
           ? canvasDx * Math.cos(radians) + canvasDy * Math.sin(radians)
           : canvasDx;
+        // A flipped table's columns run right to left.
+        const dx = flipsOf(element).flipX ? -along : along;
         const totalWeight = drag.originWidths.reduce((sum, width) => sum + width, 0);
         const pixels = drag.originWidths.map((width) => width / totalWeight * element.w);
         const left = drag.column;
@@ -3116,6 +3653,12 @@ export class EditorCanvas {
             const control = resizePointByScale(origin.control, origin, resized, scaleX, scaleY);
             el.control = { x: Math.round(control.x), y: Math.round(control.y) };
           }
+          // A drawn path is redrawn at the new size rather than stretched by
+          // its viewBox, which would stretch its stroke too: a line drawn
+          // with the pen keeps its width however its box is pulled.
+          if (el.type === 'shape' && origin.path) {
+            redrawPathAtSize(el, origin.path, origin);
+          }
         });
         for (const id of drag.origins.keys()) this.syncTableHeight(id);
         break;
@@ -3135,8 +3678,8 @@ export class EditorCanvas {
 
         let rotation = drag.originRotation + drag.accumulatedAngle * (180 / Math.PI);
         // Shift gives a precise, discoverable snap without changing the normal
-        // free-rotation gesture.
-        if (ev.shiftKey) rotation = Math.round(rotation / 15) * 15;
+        // free-rotation gesture -- the same step the inspector's dial snaps to.
+        if (ev.shiftKey) rotation = snapAngle(rotation);
         rotation = Math.round(rotation * 10) / 10;
         this.store.updateSelected((target) => {
           if (target.id === drag.elementId) target.rot = rotation;
@@ -3228,6 +3771,24 @@ export class EditorCanvas {
         break;
       }
 
+      case 'path-point': {
+        const drag = this.drag;
+        this.store.updateSelected((target) => {
+          if (target.id === drag.elementId && target.type === 'shape') {
+            this.dragPathPoint(target, drag, point, ev);
+          }
+        });
+        break;
+      }
+
+      case 'path-bend': {
+        const drag = this.drag;
+        this.store.updateSelected((target) => {
+          if (target.id === drag.elementId && target.type === 'shape') bendPath(target, drag, point);
+        });
+        break;
+      }
+
       case 'marquee': {
         const s = this.drag.startCanvas;
         this.marquee = {
@@ -3252,14 +3813,30 @@ export class EditorCanvas {
     if (
       this.drag.kind === 'none'
       && (ev.target as HTMLElement | null)?.closest?.(
-        '.welcome-screen, .zoom-controls, .notes-toggle, .notes-drawer',
+        `.welcome-screen, .zoom-controls, .notes-toggle, .notes-drawer, .objects-toggle, .objects-drawer, .light-table, .canvas-ruler, .${CODE_EDIT_CHROME}`,
       )
     ) {
+      return;
+    }
+    if (this.pen) {
+      this.host.releasePointerCapture?.(ev.pointerId);
+      if (this.pen.up()) this.finishPen(true);
+      else this.redrawOverlay();
+      return;
+    }
+    if (this.pencil) {
+      this.host.releasePointerCapture?.(ev.pointerId);
+      const stroke = this.pencil.stroke;
+      this.pencil.stroke = null;
+      if (stroke) this.finishPencilStroke(stroke);
+      this.redrawOverlay();
       return;
     }
     const textEdit = !this.dragStarted ? this.pendingTextEdit : null;
     const mediaToggle = !this.dragStarted ? this.pendingMediaToggle : null;
     this.pendingMediaToggle = null;
+    const pathEdit = !this.dragStarted ? this.pendingPathEdit : null;
+    this.pendingPathEdit = null;
     if (this.drag.kind === 'marquee' && this.marquee) {
       const slide = this.store.slide;
       if (slide) {
@@ -3278,6 +3855,7 @@ export class EditorCanvas {
       this.mediaToggledAt = ev.timeStamp;
       this.toggleMedia(mediaToggle);
     }
+    if (pathEdit && this.pathEdit?.elementId !== pathEdit) this.beginPathEdit(pathEdit);
   }
 
   /**
@@ -3307,6 +3885,22 @@ export class EditorCanvas {
     if (el?.type === 'video') this.toggleVideo(elementId);
     else if (el?.type === 'web') this.toggleWebLive(elementId);
     else if (el?.type === 'image') this.toggleMaskMode(elementId);
+    else if (el?.type === 'code' && this.pendingCodePoint) this.codeEditor.begin(elementId, this.pendingCodePoint);
+  }
+
+  /** Start typing into a code block on the slide; `'all'` selects its code to be typed over. */
+  beginCodeEdit(elementId: string, at?: { clientX: number; clientY: number } | 'all'): boolean {
+    return this.codeEditor.begin(elementId, at);
+  }
+
+  /** The code block being typed into, or null. */
+  editingCodeId(): string | null {
+    return this.codeEditor.editingId();
+  }
+
+  /** End a code edit, committing it. */
+  endCodeEdit(): void {
+    this.codeEditor.end(true);
   }
 
   private endDrag(): void {
@@ -3321,6 +3915,7 @@ export class EditorCanvas {
     this.marquee = null;
     this.pendingTextEdit = null;
     this.pendingMediaToggle = null;
+    this.pendingPathEdit = null;
 
     // Deliberately *not* a full render. Redrawing the slide layer here would
     // replace the node the pointer went down on, and a browser cannot
@@ -3423,6 +4018,12 @@ export class EditorCanvas {
    * play a video, crop a picture (and double-click again to leave the crop).
    */
   private onDoubleClick(ev: PointerEvent | MouseEvent): void {
+    // Two quick presses on the comparison chip are two choices, not a way
+    // into whatever lies under it.
+    if ((ev.target as HTMLElement).closest(`.${COMPARE_CHIP_CLASS}`)) return;
+    // The pen reads its own double-click, from the presses (penPointerDown);
+    // with the pencil out, presses only draw.
+    if (this.pen || this.pencil || ev.timeStamp - this.penFinishedAt <= DOUBLE_CLICK_MS) return;
     // Once editing is active, native browser double-click selection owns this
     // gesture. Calling beginTextEdit again would select the entire text box and
     // replace the word selection the browser just made. Under heavy renderer
@@ -3470,7 +4071,10 @@ export class EditorCanvas {
     const hit = this.hitTest(this.toCanvas(ev as PointerEvent));
     if (!hit) return;
 
-    if (hit.type === 'text' || hit.type === 'html') {
+    // Any line — straight, curved, an arrow, a path — opens its points, as in Figma.
+    if (isLineFamily(hit)) {
+      if (this.pathEdit?.elementId !== hit.id && editableRuns(hit)) this.beginPathEdit(hit.id);
+    } else if (hit.type === 'text' || hit.type === 'html') {
       this.beginTextEdit(hit.id);
     } else if (hit.type === 'shape' && canHoldText(hit)) {
       // Typing into a rectangle or an ellipse makes it a text box with the
@@ -3490,7 +4094,425 @@ export class EditorCanvas {
       // toggled on its second pointer-up; toggling again would undo it.
       if (ev.timeStamp - this.mediaToggledAt <= DOUBLE_CLICK_MS) return;
       this.toggleMedia(hit.id);
+    } else if (hit.type === 'code') {
+      // Code is typed into on the slide; the second press of the pair may
+      // already have opened it (see pendingMediaToggle).
+      if (this.codeEditor.editingId() === hit.id) return;
+      this.codeEditor.begin(hit.id, { clientX: ev.clientX, clientY: ev.clientY });
     }
+  }
+
+  /** Start drawing a path with the pen (Pen ▾ → Pen, or P). */
+  startPen(): void {
+    const slide = this.store.slide;
+    if (!slide) return;
+    this.endDrawingModes();
+    this.pen = new PenDraft(slide.id);
+    pathKeysOwner = this;
+    this.host.classList.add('pen-tool');
+    this.onPenToolChange?.('pen');
+    this.store.clearSelection();
+    this.redrawOverlay();
+    this.notice('Click to add points, drag to curve. Click the first point to close the shape; Return to finish a line.');
+  }
+
+  /** Start drawing freehand with the pencil (Pen ▾ → Pencil, or Shift+P). */
+  startPencil(): void {
+    const slide = this.store.slide;
+    if (!slide) return;
+    this.endDrawingModes();
+    this.pencil = { slideId: slide.id, stroke: null };
+    pathKeysOwner = this;
+    this.host.classList.add('pencil-tool');
+    this.onPenToolChange?.('pencil');
+    this.store.clearSelection();
+    this.redrawOverlay();
+    this.notice('Drag to draw; each stroke becomes a smooth line. Escape or Return when done.');
+  }
+
+  /** What the pen and pencil leave behind when another mode, or the other of the two, starts. */
+  private endDrawingModes(): void {
+    if (this.editingId) this.endTextEditing(true);
+    if (this.maskingId) this.toggleMaskMode(null);
+    this.endWebLive();
+    this.endPathEdit();
+    this.endPen();
+    this.endPencil();
+  }
+
+  /** The Pen button: take the pen up, or put it down, finishing a line. */
+  togglePen(): void {
+    if (this.pen) this.finishPen(false);
+    else this.startPen();
+  }
+
+  /** The Pencil: take it up, or put it down. */
+  togglePencil(): void {
+    if (this.pencil) this.endPencil();
+    else this.startPencil();
+  }
+
+  /** Which drawing tool is out, if either. */
+  drawingTool(): DrawingTool | null {
+    return this.pen ? 'pen' : this.pencil ? 'pencil' : null;
+  }
+
+  /** Whether the pen is drawing. */
+  isDrawingPath(): boolean {
+    return this.pen !== null;
+  }
+
+  /** Put the pen down without adding anything. */
+  private endPen(): void {
+    if (!this.pen) return;
+    this.pen = null;
+    this.host.classList.remove('pen-tool');
+    this.onPenToolChange?.(null);
+    this.redrawOverlay();
+    // Take the pen's instructions out of the status bar.
+    this.notice('');
+  }
+
+  /** Put the pencil down; a stroke still under the pointer is dropped. */
+  private endPencil(): void {
+    if (!this.pencil) return;
+    this.pencil = null;
+    this.host.classList.remove('pencil-tool');
+    this.onPenToolChange?.(null);
+    this.redrawOverlay();
+    this.notice('');
+  }
+
+  /**
+   * A pencil stroke is done: its samples, smoothed, become a path on the
+   * slide it was drawn on. The pencil stays out and nothing is selected, so
+   * the next stroke can follow straight on.
+   */
+  private finishPencilStroke(samples: XY[]): void {
+    const pencil = this.pencil;
+    if (!pencil) return;
+    const run = freehandRun(samples, PENCIL_TOLERANCE_SCREEN_PX / this.scale);
+    const index = this.store.get().deck.slides.findIndex((slide) => slide.id === pencil.slideId);
+    if (!run || index < 0) return;
+    insertPath(this.store, index, run, { select: false, label: 'Draw with Pencil' });
+  }
+
+  /**
+   * Finish the drawing: closed, a filled shape; open, a line. Fewer than two
+   * points draw nothing, and the pen is simply put down.
+   */
+  private finishPen(closed: boolean): void {
+    const pen = this.pen;
+    if (!pen) return;
+    this.endPen();
+    const run = pen.result(closed);
+    const index = this.store.get().deck.slides.findIndex((slide) => slide.id === pen.slideId);
+    if (!run || index < 0) return;
+    insertPath(this.store, index, run);
+  }
+
+  private penPointerDown(ev: PointerEvent, point: XY, secondClick: boolean): void {
+    const pen = this.pen!;
+    const tolerance = PEN_POINT_SCREEN_PX / this.scale;
+    // The second press of a double-click on the point the first one placed
+    // finishes the line there.
+    if (secondClick && pen.onLast(point, tolerance)) {
+      if (pen.nodes.length < 2) return;
+      this.penFinishedAt = ev.timeStamp;
+      this.finishPen(false);
+      return;
+    }
+    pen.down(wholePixel(point), ev.shiftKey, tolerance);
+    this.redrawOverlay();
+  }
+
+  private onPathKey(ev: KeyboardEvent): void {
+    if ((!this.pen && !this.pathEdit && !this.pencil) || pathKeysOwner !== this) return;
+    const t = ev.target instanceof HTMLElement ? ev.target : null;
+    if (t && (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName))) return;
+    if (this.pencil) {
+      // Undo and everything else stay the deck's: each stroke is already in it.
+      if (ev.key !== 'Escape' && ev.key !== 'Enter') return;
+      this.endPencil();
+      ev.preventDefault();
+      ev.stopImmediatePropagation();
+      return;
+    }
+    if (!this.pen) {
+      this.onPathEditKey(ev);
+      return;
+    }
+    const undo = (ev.metaKey || ev.ctrlKey) && !ev.shiftKey && ev.key.toLowerCase() === 'z';
+    if (ev.key === 'Enter' || ev.key === 'Escape') {
+      this.finishPen(false);
+    } else if ((ev.key === 'Backspace' || ev.key === 'Delete' || undo) && this.pen.nodes.length > 0) {
+      this.pen.removeLast();
+      this.redrawOverlay();
+    } else {
+      // With nothing drawn yet, undo is the deck's again.
+      return;
+    }
+    ev.preventDefault();
+    ev.stopImmediatePropagation();
+  }
+
+  /** The path whose points are being edited, if any. */
+  pathEditingElement(): string | null {
+    return this.pathEdit?.elementId ?? null;
+  }
+
+  /** Start or stop editing a path's points (Edit points; null stops). */
+  togglePathEdit(elementId: string | null): void {
+    if (elementId === null || this.pathEdit?.elementId === elementId) this.endPathEdit();
+    else this.beginPathEdit(elementId);
+  }
+
+  private beginPathEdit(elementId: string): void {
+    const el = this.store.slide?.elements.find((candidate) => candidate.id === elementId);
+    if (!el || !editableRuns(el)) return;
+    if (this.editingId) this.endTextEditing(true);
+    if (this.maskingId) this.toggleMaskMode(null);
+    this.endPen();
+    this.endPencil();
+    this.pathEdit = { elementId, point: null };
+    pathKeysOwner = this;
+    const selected = this.store.get().selection;
+    if (selected.size !== 1 || !selected.has(elementId)) this.store.select([elementId]);
+    this.onPathEditChange?.(elementId);
+    this.redrawOverlay();
+    this.notice('Drag points and handles; click the outline to add a point, Cmd/Ctrl-drag it to bend. Option-drag a handle to break it, Delete removes a point, Escape when done.');
+  }
+
+  private endPathEdit(): void {
+    if (!this.pathEdit) return;
+    this.pathEdit = null;
+    this.onPathEditChange?.(null);
+    this.redrawOverlay();
+    this.notice('');
+  }
+
+  /**
+   * The edited path's points over the slide: every anchor, and the handles
+   * that shape the curves on either side of the selected one.
+   */
+  private pathEditOverlay(elementId: string, paths: SubPath[], deck: Deck): DocumentFragment {
+    const selected = this.pathEdit?.point ?? null;
+    const knobs: OverlayKnob[] = [];
+    if (selected) {
+      const run = paths[selected.sub];
+      const count = run.nodes.length;
+      const neighbours = [
+        { index: selected.index, sides: ['in', 'out'] as const },
+        ...(selected.index > 0 || run.closed
+          ? [{ index: (selected.index - 1 + count) % count, sides: ['out'] as const }] : []),
+        ...(selected.index < count - 1 || run.closed
+          ? [{ index: (selected.index + 1) % count, sides: ['in'] as const }] : []),
+      ];
+      for (const { index, sides } of neighbours) {
+        const node = run.nodes[index];
+        for (const side of sides) {
+          const at = node[side];
+          if (at) knobs.push({ at, from: node, key: `${selected.sub}:${index}:${side}` });
+        }
+      }
+    }
+    return pathOverlay({
+      outline: serializePath(paths),
+      anchors: paths.flatMap((run, sub) => run.nodes.map((node, index) => ({
+        at: node,
+        key: `${sub}:${index}`,
+        selected: selected?.sub === sub && selected.index === index,
+      }))),
+      knobs,
+      elementId,
+      scale: this.scale,
+      canvas: deck.canvas,
+    });
+  }
+
+  /**
+   * A press while a path's points are being edited. On a point or a handle it
+   * starts dragging that; on the outline it adds a point there and drags the
+   * new point. Elsewhere on the path it only clears the point selection, and
+   * anywhere else it ends point editing; either way the press then goes on as
+   * an ordinary one (returns false).
+   */
+  private pathEditPointerDown(ev: PointerEvent, target: HTMLElement, point: XY, secondClick: boolean): boolean {
+    const edit = this.pathEdit!;
+    const el = this.store.slide?.elements.find((candidate) => candidate.id === edit.elementId);
+    const paths = el ? editableRuns(el) : null;
+    if (el?.type !== 'shape' || !paths) {
+      this.endPathEdit();
+      return false;
+    }
+    const begin = (label: string, sub: number, index: number, which: 'anchor' | 'in' | 'out', origin: ShapeEl) => {
+      edit.point = { sub, index };
+      this.drag = { kind: 'path-point', elementId: el.id, sub, index, which, startCanvas: point, origin };
+      this.store.beginTransaction(label);
+      this.redrawOverlay();
+    };
+    const handleKey = target.dataset?.pathHandle;
+    if (handleKey && target.dataset.elementId === el.id) {
+      const [sub, index, which] = handleKey.split(':');
+      // A neighbour's handle may be the one grabbed; the selected point, whose
+      // handles are on show, stays the selected one.
+      const selected = edit.point;
+      begin('Move handle', Number(sub), Number(index), which as 'in' | 'out', el);
+      edit.point = selected;
+      return true;
+    }
+    const pointKey = target.dataset?.pathNode;
+    if (pointKey && target.dataset.elementId === el.id) {
+      // A double-click on a point turns a corner smooth or a smooth point
+      // sharp. Read from the presses: the overlay is redrawn under the
+      // pointer by the first one, so no dblclick names the point.
+      if (secondClick) {
+        this.togglePathPointSmooth(pointKey);
+        return true;
+      }
+      const [sub, index] = pointKey.split(':').map(Number);
+      begin('Move point', sub, index, 'anchor', el);
+      return true;
+    }
+    const hit = nearestOnPath(paths, point);
+    if (hit && hit.distance <= LINE_HIT_SCREEN_PX / this.scale && commandModifier(ev)) {
+      // Cmd/Ctrl on the outline is Figma's bend: the line curves to follow
+      // the pointer, a straight line becoming a curve and staying a line.
+      edit.point = null;
+      this.store.beginTransaction('Bend');
+      this.drag = {
+        kind: 'path-bend', elementId: el.id, sub: hit.sub, segment: hit.segment, t: hit.t,
+        through: hit.point, startCanvas: point, origin: el,
+      };
+      this.redrawOverlay();
+      return true;
+    }
+    if (hit && hit.distance <= LINE_HIT_SCREEN_PX / this.scale) {
+      // One undo step: the new point and wherever this press drags it. A
+      // line given a third point becomes a path.
+      this.store.beginTransaction('Add point');
+      let added = -1;
+      this.store.updateSelected((shape) => {
+        if (shape.id !== el.id || shape.type !== 'shape') return;
+        const next = editableRuns(shape)!;
+        added = insertNode(next, hit.sub, hit.segment, hit.t);
+        setEditableRuns(shape, next);
+      });
+      const inserted = this.store.slide?.elements.find((candidate) => candidate.id === el.id);
+      if (inserted?.type === 'shape' && added >= 0) begin('Add point', hit.sub, added, 'anchor', inserted);
+      return true;
+    }
+    edit.point = null;
+    if (this.hitTest(point)?.id !== el.id) this.endPathEdit();
+    else this.redrawOverlay();
+    return false;
+  }
+
+  /**
+   * One frame of a point or handle drag, always from the shape as the drag
+   * found it. Shift keeps a point on a 45° line from where it started, or a
+   * handle at a 45° angle; Option/Alt moves a handle alone.
+   */
+  private dragPathPoint(
+    target: ShapeEl,
+    drag: Extract<DragMode, { kind: 'path-point' }>,
+    point: XY,
+    ev: PointerEvent,
+  ): void {
+    const { origin } = drag;
+    restoreShape(target, origin);
+    const dx = point.x - drag.startCanvas.x;
+    const dy = point.y - drag.startCanvas.y;
+    // A line stays a line: its ends move with its curve's control point left
+    // where it was, and either handle moves that control point, the other
+    // following. Only a handle broken free (Option) takes it past what a
+    // line can be, into a path.
+    if (isTwoPointLine(origin) && (drag.which === 'anchor' || !ev.altKey)) {
+      const { start, end } = lineEndpoints(origin);
+      const ends = [start, end];
+      const node = ends[drag.index];
+      if (!node) return;
+      if (drag.which === 'anchor') {
+        const moved = wholePixel({ x: node.x + dx, y: node.y + dy });
+        ends[drag.index] = ev.shiftKey ? constrainAngle(node, moved) : moved;
+        Object.assign(target, lineFromEndpoints(ends[0], ends[1], origin.h));
+        target.control = origin.control ? { ...origin.control } : null;
+        return;
+      }
+      const handle = lineRun(start, end, origin.control).nodes[drag.index][drag.which];
+      if (!handle) return;
+      const moved = wholePixel({ x: handle.x + dx, y: handle.y + dy });
+      const control = controlFromHandle(node, ev.shiftKey ? constrainAngle(node, moved) : moved);
+      target.control = { x: Math.round(control.x), y: Math.round(control.y) };
+      return;
+    }
+    const paths = editableRuns(target);
+    const node = paths?.[drag.sub]?.nodes[drag.index];
+    if (!paths || !node) return;
+    if (drag.which === 'anchor') {
+      const moved = wholePixel({ x: node.x + dx, y: node.y + dy });
+      moveNode(node, ev.shiftKey ? constrainAngle(node, moved) : moved);
+    } else {
+      const handle = node[drag.which];
+      if (!handle) return;
+      const moved = wholePixel({ x: handle.x + dx, y: handle.y + dy });
+      moveHandle(node, drag.which, ev.shiftKey ? constrainAngle(node, moved) : moved, ev.altKey);
+    }
+    setEditableRuns(target, paths);
+  }
+
+  /** A double-click on a point: a corner becomes smooth, a smooth point a corner. */
+  private togglePathPointSmooth(key: string): void {
+    const edit = this.pathEdit;
+    if (!edit) return;
+    const [sub, index] = key.split(':').map(Number);
+    edit.point = { sub, index };
+    this.store.updateSelected((shape) => {
+      if (shape.id !== edit.elementId || shape.type !== 'shape') return;
+      const paths = editableRuns(shape);
+      if (!paths?.[sub]?.nodes[index]) return;
+      toggleSmooth(paths[sub], index);
+      setEditableRuns(shape, paths);
+    }, { label: 'Smooth or sharpen point' });
+    this.redrawOverlay();
+  }
+
+  private onPathEditKey(ev: KeyboardEvent): void {
+    const edit = this.pathEdit!;
+    if (ev.key === 'Escape' || ev.key === 'Enter') {
+      this.endPathEdit();
+    } else if (ev.key === 'Backspace' || ev.key === 'Delete') {
+      const point = edit.point;
+      if (point) this.deletePathPoint(edit.elementId, point);
+    } else {
+      return;
+    }
+    ev.preventDefault();
+    ev.stopImmediatePropagation();
+  }
+
+  /** Remove a point; removing the last one that leaves a line removes the shape. */
+  private deletePathPoint(elementId: string, point: { sub: number; index: number }): void {
+    const el = this.store.slide?.elements.find((candidate) => candidate.id === elementId);
+    const paths = el ? editableRuns(el) : null;
+    if (!paths) return;
+    const remaining = removeNode(paths, point.sub, point.index);
+    this.pathEdit!.point = null;
+    if (remaining.length === 0) {
+      this.store.deleteSelection();
+      return;
+    }
+    this.store.updateSelected((shape) => {
+      if (shape.id === elementId && shape.type === 'shape') setEditableRuns(shape, remaining);
+    }, { label: 'Delete point' });
+    this.redrawOverlay();
+  }
+
+  /** Redraw just the chrome over the slide, for state the deck does not hold. */
+  private redrawOverlay(): void {
+    const { deck, slideIndex, selection } = this.store.get();
+    const slide = deck.slides[slideIndex];
+    if (slide) this.drawOverlay(deck, slide.elements, selection);
   }
 
   /** Whether this web element's page is currently running on the canvas. */
@@ -3613,6 +4635,16 @@ export class EditorCanvas {
     const range = this.activeTextRange(body);
     if (!range) return null;
     return this.textOffsetsForRange(body, range);
+  }
+
+  /** The active text selection by block (caretPath.ts), for a session a rebuild ends and reopens. */
+  private editingSelectionBookmark(): TextBookmark | null {
+    if (!this.editingId) return null;
+    const body = this.slideLayer.querySelector<HTMLElement>(
+      `[data-element-id="${CSS.escape(this.editingId)}"] .text-content`,
+    );
+    const range = body ? this.activeTextRange(body) : null;
+    return body && range ? textBookmark(body, TEXT_BLOCKS, range) : null;
   }
 
   /** Re-select the given offsets inside the element being edited. */
@@ -3933,6 +4965,7 @@ export class EditorCanvas {
         adoptComposedText(event.data, compositionPendingStyle);
       }
       compositionPendingStyle = null;
+      isolateTypingSentinel(window.getSelection());
       if (this.liveTextSync && !liveTimer) liveTimer = window.setTimeout(pushLive, 250);
       scheduleIdleSeal();
     };
@@ -4354,6 +5387,12 @@ export class EditorCanvas {
      * Chromium splits the paragraph and re-established on the line it opens.
      */
     let breakFormats: TypingFormats | null = null;
+    /**
+     * Whether the text being typed replaces a selection across lines: that
+     * joins blocks as a Backspace across them does, and the join copies the
+     * same computed style onto the moved text.
+     */
+    let typedOverLines = false;
     /** The fitted size the text being pasted was copied at, if it came from an auto-fit box. */
     let pastedFit: string | null = null;
     const onInput = (event?: Event) => {
@@ -4363,7 +5402,9 @@ export class EditorCanvas {
         breakFormats = null;
         this.carryTypingFormatsOntoLine(body, formats);
       }
-      if (typed && typed.inputType !== 'insertText' && !typed.inputType.endsWith('CompositionText')) {
+      const restructured = typed?.inputType === 'insertText' ? typedOverLines : true;
+      typedOverLines = false;
+      if (typed && restructured && !typed.inputType.endsWith('CompositionText')) {
         // Whenever Chromium restructures blocks it copies the computed layout
         // of the block it took apart onto what it made: a cut or Backspace
         // across a list item boundary wraps the moved text in a span wearing
@@ -4371,7 +5412,9 @@ export class EditorCanvas {
         // into a paragraph carrying that indent in pixels. Paste strips those
         // declarations on the way in; every other structural input has to as
         // well, or the box saves an indent no control can reach. Plain typing
-        // is left alone: it never restructures anything, and it is hot.
+        // is left alone: it never restructures anything, and it is hot. Typing
+        // over lines does (nightly list fuzz seed 2026103001: the joined words
+        // kept the size the box was fitted to before the join).
         stripLayoutDeclarations(body, { keepLineSpacing: true });
         // In an auto-fit box the computed style a join copies includes the
         // fitted size, which would freeze the moved text at it.
@@ -4379,10 +5422,12 @@ export class EditorCanvas {
           stripFittedFontSize(body, body.style.fontSize);
         }
         if (typed.inputType === 'insertFromPaste' && pastedFit) stripFittedFontSize(body, pastedFit);
+        joinAdjacentLists();
       }
       if (typed?.inputType === 'insertFromPaste') pastedFit = null;
       if (typed?.inputType.startsWith('delete')) {
         repairEmptiedBox();
+        settleEmptiedItems(body, this.activeTextRange(body)?.startContainer ?? null);
         // Deleting a selection that spans a whole cell's text can take the
         // cell's editor-only highlight class with it (Chromium rebuilds the
         // cell's content), leaving a live cell range that paints nothing
@@ -4412,6 +5457,9 @@ export class EditorCanvas {
         // The space that ends a URL is the moment it becomes a link.
         linkifyTypedUrl();
       }
+      if (typed?.inputType === 'insertText' && !typed.isComposing) {
+        isolateTypingSentinel(window.getSelection());
+      }
       if (el.type === 'text' && (el.autoFit || el.noWrap) && !el.autoSize) scheduleAutoFit(node!);
       if (el.type === 'text' && el.autoSize) this.followTextSizeWhileEditing(node!, el.id);
       if (this.liveTextSync && !liveTimer) liveTimer = window.setTimeout(pushLive, 250);
@@ -4430,6 +5478,29 @@ export class EditorCanvas {
       if (endsRun) sealTextChunk();
       else scheduleIdleSeal();
     };
+    // Two lists of a kind left side by side -- the line between them deleted
+    // -- are one list in the deck. Left apart while editing, the second kept
+    // its own start, and an item shown as 2. became 3. the moment editing
+    // ended (list fuzz seed 2026102302). Moving the items drops the caret out
+    // of them, so it is put back where it stood.
+    const joinAdjacentLists = () => {
+      const range = this.activeTextRange(body);
+      const kept = range
+        ? { start: [range.startContainer, range.startOffset], end: [range.endContainer, range.endOffset] } as const
+        : null;
+      if (!mergeAdjacentLists(body) || !kept) return;
+      const next = document.createRange();
+      try {
+        next.setStart(kept.start[0], kept.start[1]);
+        next.setEnd(kept.end[0], kept.end[1]);
+      } catch {
+        return;
+      }
+      const selection = window.getSelection();
+      selection?.removeAllRanges();
+      selection?.addRange(next);
+      this.textSelectionRange = next.cloneRange();
+    };
     const sealActiveTypingStyle = () => {
       const range = this.activeTextRange(body);
       if (!range?.collapsed) return;
@@ -4444,6 +5515,12 @@ export class EditorCanvas {
       else if (offsets) this.restoreTextRange(body, offsets);
     };
     const onBeforeInput = (event: InputEvent) => {
+      if (event.inputType === 'insertText') {
+        const range = this.activeTextRange(body);
+        const blockOf = (node: Node) => (node instanceof Element ? node : node.parentElement)?.closest(TEXT_BLOCKS);
+        typedOverLines = Boolean(range && !range.collapsed
+          && blockOf(range.startContainer) !== blockOf(range.endContainer));
+      }
       if (event.inputType === 'insertParagraph' || event.inputType === 'insertLineBreak') {
         // What the author has switched on or off at the caret is what the
         // next line starts with — including a format switched *off* whose
@@ -4475,16 +5552,52 @@ export class EditorCanvas {
           ? 'italic'
           : event.inputType === 'formatUnderline'
             ? 'underline'
-            : null;
+            : event.inputType === 'formatStrikeThrough'
+              ? 'strikethrough'
+              : null;
       if (nativeFormat) {
         // Electron/Chromium can route macOS editing commands through
         // beforeinput without delivering the corresponding Cmd+B/Cmd+I/Cmd+U
-        // keydown to the contenteditable. Own those semantic commands too so
+        // (or strikethrough) keydown to the contenteditable. Own those semantic commands too so
         // native menu/accelerator routing and physical keyboard routing have
         // identical, model-backed formatting behaviour.
         event.preventDefault();
         this.toggleTextSelectionFormat(nativeFormat);
         return;
+      }
+      if (!event.isComposing && /^(?:deleteContent(?:Backward|Forward)|deleteWord(?:Backward|Forward)|deleteByCut|insertText)$/
+        .test(event.inputType)) {
+        // A selection from one line into another, where a list is involved:
+        // the two ends become one line (see deleteAcrossLines), and a typed
+        // letter goes in at the join.
+        const span = this.activeTextRange(body);
+        const join = span && !span.collapsed ? deleteAcrossLines(body, span) : null;
+        if (join) {
+          event.preventDefault();
+          if (event.inputType === 'insertText' && event.data) {
+            const at = join.startContainer;
+            if (at instanceof Text) {
+              at.insertData(join.startOffset, event.data);
+              join.setStart(at, join.startOffset + event.data.length);
+            } else {
+              const typed = document.createTextNode(event.data);
+              const ref = at.childNodes[join.startOffset] ?? null;
+              if (ref instanceof HTMLElement && ref.tagName === 'BR' && at.childNodes.length === 1) {
+                ref.replaceWith(typed);
+              } else {
+                at.insertBefore(typed, ref);
+              }
+              join.setStart(typed, typed.data.length);
+            }
+            join.collapse(true);
+          }
+          const selection = window.getSelection();
+          selection?.removeAllRanges();
+          selection?.addRange(join);
+          this.textSelectionRange = join.cloneRange();
+          onInput(event);
+          return;
+        }
       }
       if (
         event.inputType !== 'insertText'
@@ -4554,6 +5667,20 @@ export class EditorCanvas {
         this.toggleTextSelectionFormat(
           e.key === '=' || e.key === '+' ? 'superscript' : 'subscript',
         );
+      } else if (
+        (e.metaKey || e.ctrlKey) && !e.shiftKey && !e.altKey
+        && (e.code === 'BracketLeft' || e.code === 'BracketRight')
+      ) {
+        // Keynote's and Google Slides' indent chords, for paragraphs as well
+        // as list items. By physical key, as the arrange chords are.
+        e.preventDefault();
+        sealTextChunk();
+        this.shiftTextIndent(e.code === 'BracketRight' ? 'in' : 'out');
+      } else if ((e.metaKey || e.ctrlKey) && e.shiftKey && !e.altKey && e.key.toLowerCase() === 'x') {
+        // Strikethrough, as in Google Docs and Slides. Shift keeps it clear
+        // of Cut.
+        e.preventDefault();
+        this.toggleTextSelectionFormat('strikethrough');
       } else if (this.handleZoomShortcut(e)) {
         // The unshifted chords zoom the canvas here too: they mean nothing to
         // the text, and would otherwise zoom the whole page.
@@ -4884,6 +6011,16 @@ export class EditorCanvas {
     const range = document.createRange();
     range.setStart(start.node, start.offset);
     range.setEnd(end.node, end.offset);
+    this.selectTextRange(root, range);
+  }
+
+  /** Put a selection taken before `root` was rewritten back, carried through the rewrite. */
+  private restoreTextBookmark(root: HTMLElement, bookmark: TextBookmark): void {
+    this.selectTextRange(root, rangeForBookmark(root, TEXT_BLOCKS, bookmark));
+  }
+
+  /** Make `range` the live selection and the session bookmark. */
+  private selectTextRange(root: HTMLElement, range: Range): void {
     this.textSelectionRange = range.cloneRange();
     // Asserting a live range inside a contenteditable MOVES FOCUS to it in
     // Chromium — no focus() call involved. While the author is in a panel
@@ -4970,7 +6107,13 @@ export class EditorCanvas {
     return true;
   }
 
-  /** Text node whose authored style controls typing at a collapsed caret. */
+  /**
+   * Text node whose authored style controls typing at a collapsed caret, or
+   * null on a line with no text. Only the caret's own line counts: on an empty
+   * line the flat offset lands on a word of the line before or after, and
+   * Return there opened a line in that word's bold, italic and underline
+   * (nightly seed 20261031).
+   */
   private textNodeAtCaret(root: HTMLElement, range: Range): Text | null {
     if (range.startContainer instanceof Text) return range.startContainer;
     const offsets = this.textOffsetsForRange(root, range);
@@ -4978,13 +6121,20 @@ export class EditorCanvas {
     const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
     let cursor = 0;
     let previous: Text | null = null;
+    let found: Text | null = null;
     for (let current = walker.nextNode(); current; current = walker.nextNode()) {
       const text = current as Text;
-      if (offsets.start <= cursor + text.data.length) return text;
+      if (offsets.start <= cursor + text.data.length) {
+        found = text;
+        break;
+      }
       cursor += text.data.length;
       previous = text;
     }
-    return previous;
+    found ??= previous;
+    const start = range.startContainer instanceof Element ? range.startContainer : range.startContainer.parentElement;
+    const line = start?.closest(TEXT_BLOCKS);
+    return found && line && root.contains(line) && !line.contains(found) ? null : found;
   }
 
   /**
@@ -5171,6 +6321,7 @@ export class EditorCanvas {
       underline: link
         ? this.elementFormatState(link.element, link.content, 'underline')
         : this.textSelectionFormatState('underline'),
+      strikethrough: this.textSelectionFormatState('strikethrough'),
       superscript: this.textSelectionFormatState('superscript'),
       subscript: this.textSelectionFormatState('subscript'),
       runStyles: this.runStylesAtCaret(),
@@ -5278,8 +6429,8 @@ export class EditorCanvas {
     if (formats.italic !== has('italic')) {
       declarations.push(['fontStyle', formats.italic ? 'italic' : 'normal']);
     }
-    if (formats.underline !== has('underline')) {
-      declarations.push(['textDecorationLine', formats.underline ? 'underline' : 'none']);
+    if (formats.underline !== has('underline') || formats.strikethrough !== has('strikethrough')) {
+      declarations.push(['textDecorationLine', decorationLineValue(formats)]);
     }
     if (formats.superscript !== has('superscript') || formats.subscript !== has('subscript')) {
       declarations.push(...BASELINE_DECLARATIONS[
@@ -5360,6 +6511,97 @@ export class EditorCanvas {
     const node = body.closest<HTMLElement>('.element');
     if (node) scheduleAutoFit(node);
     return true;
+  }
+
+  /**
+   * Indent or outdent everything the caret or the selection touches: the
+   * Indent buttons and Cmd/Ctrl+] and [. A list item moves one level, exactly
+   * as Tab and shift-Tab move it; a paragraph outside a list steps its own
+   * indent (see PARAGRAPH_INDENT_ATTRIBUTE). True when the request was taken,
+   * including one with nothing left to do, such as outdenting a flush line.
+   */
+  shiftTextIndent(direction: 'in' | 'out'): boolean {
+    if (!this.editingId || this.tableSelection) return false;
+    const body = this.slideLayer.querySelector<HTMLElement>(
+      `[data-element-id="${CSS.escape(this.editingId)}"] .text-content`,
+    );
+    if (!body) return false;
+    const live = window.getSelection();
+    const current = live && live.rangeCount > 0 ? live.getRangeAt(0) : null;
+    if (!current || !body.contains(current.commonAncestorContainer)) {
+      // Focus went to the panel: act on the bookmark taken before it did.
+      const saved = this.textSelectionRange;
+      if (!saved || !body.contains(saved.commonAncestorContainer)) return false;
+      live?.removeAllRanges();
+      live?.addRange(saved.cloneRange());
+    }
+    const range = live!.getRangeAt(0);
+    const touches = (node: Node): boolean => {
+      try {
+        return range.collapsed ? node.contains(range.startContainer) : range.intersectsNode(node);
+      } catch {
+        return false;
+      }
+    };
+    const items = this.touchedListItems(body, range);
+    let paragraphs = [...body.querySelectorAll<HTMLElement>(INDENTABLE_BLOCKS)]
+      .filter((block) => !block.closest('li, ul, ol, table') && touches(block))
+      .filter((block) => !block.querySelector(INDENTABLE_BLOCKS));
+    const offsets = this.textOffsetsForRange(body, range);
+    if (items.length === 0 && paragraphs.length === 0) {
+      // A one-line box is bare inline markup with no paragraph to carry the
+      // indent; the line the caret is on becomes one.
+      const line = this.bareLineAt(body, range);
+      if (!line || direction === 'out') return true;
+      paragraphs = [line];
+    }
+
+    let changed = false;
+    if (paragraphs.length > 0) {
+      for (const paragraph of paragraphs) {
+        const level = paragraphIndent(paragraph) + (direction === 'in' ? 1 : -1);
+        changed = setParagraphIndent(paragraph, level) || changed;
+      }
+      if (offsets) this.restoreTextRange(body, offsets);
+    }
+    if (items.length > 0) {
+      // A caret on an outer-level item has only its bullet left to give up,
+      // as with shift-Tab; that commits a step of its own.
+      if (direction === 'out' && !changed && this.unbulletCaretItem(body, 'outdent')) return true;
+      changed = this.shiftListItems(body, direction) || changed;
+    }
+    if (!changed) return true;
+    this.focusTextSurface(body);
+    const node = body.closest<HTMLElement>('.element');
+    if (node) scheduleAutoFit(node);
+    this.commitLiveTextDom(direction === 'in' ? 'Indent' : 'Outdent');
+    return true;
+  }
+
+  /**
+   * Wrap the run of bare inline markup the caret sits in, directly in the
+   * box, in a paragraph of its own, and return it. Null when the caret is
+   * inside a block already.
+   */
+  private bareLineAt(body: HTMLElement, range: Range): HTMLElement | null {
+    let top: Node | null = range.startContainer;
+    while (top && top.parentNode !== body) top = top.parentNode;
+    if (top === null && range.startContainer === body) {
+      top = body.childNodes[Math.min(range.startOffset, body.childNodes.length - 1)] ?? null;
+    }
+    const isBlock = (node: Node | null): boolean =>
+      node instanceof HTMLElement && node.matches(`${INDENTABLE_BLOCKS}, ul, ol, li, table, pre`);
+    if (!top || isBlock(top)) return null;
+    let first: Node = top;
+    while (first.previousSibling && !isBlock(first.previousSibling)) first = first.previousSibling;
+    const paragraph = document.createElement('p');
+    body.insertBefore(paragraph, first);
+    for (let node: Node | null = first; node && !isBlock(node);) {
+      const next: Node | null = node.nextSibling;
+      paragraph.appendChild(node);
+      node = next;
+    }
+    return paragraph;
   }
 
   /** Write the edited markup back to the deck as a single undoable change. */
@@ -5589,13 +6831,14 @@ export class EditorCanvas {
     );
   }
 
-  /** Return a shared authored spacing for the paragraphs in the live selection. */
-  textSelectionParagraphSpacing(): number | null {
+  /**
+   * The spacing the paragraphs in the selection declare: one value (null when
+   * none declares any), or mixed. Null without a selection.
+   */
+  textSelectionParagraphSpacing(): SelectionBlockValue | null {
     const target = this.selectedTextBlocks(false);
     if (!target) return null;
-    const values = target.blocks.map((block) => Number.parseFloat(block.style.marginBottom));
-    if (values.some((value) => !Number.isFinite(value))) return null;
-    return values.every((value) => value === values[0]) ? values[0] : null;
+    return sharedBlockValue(target.blocks.map((block) => Number.parseFloat(block.style.marginBottom)));
   }
 
   /**
@@ -5610,13 +6853,14 @@ export class EditorCanvas {
     );
   }
 
-  /** The line spacing the paragraphs in the selection share, if they declare one. */
-  textSelectionLineHeight(): number | null {
+  /**
+   * The line spacing the paragraphs in the selection declare: one value (null
+   * when they all follow the box), or mixed. Null without a selection.
+   */
+  textSelectionLineHeight(): SelectionBlockValue | null {
     const target = this.selectedTextBlocks(false);
     if (!target) return null;
-    const values = target.blocks.map((block) => Number(block.style.lineHeight || Number.NaN));
-    if (values.some((value) => !Number.isFinite(value))) return null;
-    return values.every((value) => value === values[0]) ? values[0] : null;
+    return sharedBlockValue(target.blocks.map((block) => Number(block.style.lineHeight || Number.NaN)));
   }
 
   applyTextSelectionColor(value: string | null): boolean {
@@ -5675,8 +6919,20 @@ export class EditorCanvas {
       const item = container?.closest<HTMLElement>('li') ?? null;
       return item && content.contains(item) ? [item] : [];
     }
+    // An item is touched where the range reaches its own line, not merely
+    // its sub-list: a selection inside a sub-item lies inside the item it
+    // hangs under too, and Tab then moved that parent, carrying the sub-item,
+    // instead of the sub-item (list fuzz seed 2026101501). A holder item
+    // has no line at all.
+    const intersects = (node: Node): boolean => {
+      try { return range.intersectsNode(node); } catch { return false; }
+    };
     return [...content.querySelectorAll<HTMLElement>('li')].filter((item) => {
-      try { return range.intersectsNode(item); } catch { return false; }
+      if (item.hasAttribute(LIST_HOLDER_ATTRIBUTE)) return false;
+      const own = [...item.childNodes]
+        .filter((node) => !(node instanceof Element && /^(?:UL|OL)$/.test(node.tagName)));
+      if (own.length > 0) return own.some(intersects);
+      return !item.querySelector('ul, ol') && intersects(item);
     });
   }
 
@@ -5707,7 +6963,26 @@ export class EditorCanvas {
         `${active ? 'Remove' : 'Apply'} ${format}`,
       );
     }
-    return this.applyTextSelectionStyle('textDecorationLine', active ? 'none' : 'underline');
+    return this.toggleTextSelectionDecoration(format, !active);
+  }
+
+  /**
+   * Switch one line on or off over the selection. Underline and
+   * strikethrough share `text-decoration-line`, so every run is written the
+   * value that keeps its own other line: striking through a sentence with one
+   * underlined word leaves that word underlined.
+   */
+  private toggleTextSelectionDecoration(format: DecorationFormat, on: boolean): boolean {
+    const other = otherDecoration(format);
+    const value = (otherOn: boolean): string => decorationLineValue({
+      [format]: on,
+      [other]: otherOn,
+    } as Record<DecorationFormat, boolean>);
+    return this.applyTextSelectionStyles(
+      [['textDecorationLine', value(this.textSelectionFormatState(other))]],
+      `Change selected text ${format}`,
+      (text, content) => [['textDecorationLine', value(this.textNodeFormatState(text, content, other))]],
+    );
   }
 
   textSelectionFormatState(format: InlineTextFormat): boolean {
@@ -5720,7 +6995,11 @@ export class EditorCanvas {
     if (!range) return false;
     if (range.collapsed) {
       const caret = this.textNodeAtCaret(content, range);
-      return Boolean(caret && this.textNodeFormatState(caret, content, format));
+      if (caret) return this.textNodeFormatState(caret, content, format);
+      // A line with no text: what the caret sits in (an empty formatted run,
+      // or the bare line).
+      const start = range.startContainer instanceof Element ? range.startContainer : range.startContainer.parentElement;
+      return this.elementFormatState(start, content, format);
     }
     const offsets = this.textOffsetsForRange(content, range);
     const first = offsets ? this.textSlicesForOffsets(content, offsets)[0]?.text : null;
@@ -5995,8 +7274,8 @@ export class EditorCanvas {
     if (selectedBlocks.length === 0) return this.declineLiveTextFormat();
 
     // If any selected text belongs to a list, that whole top-level list is the
-    // formatting target. Unrelated paragraphs crossed by the Range are left
-    // alone; this is the familiar Keynote/word-processor list behaviour.
+    // formatting target. Bulleted and Numbered also take in the paragraphs the
+    // Range crosses (below); None leaves them alone.
     const selectedLists = selectedBlocks.filter((block) => /^(OL|UL)$/.test(block.tagName));
     const targets = selectedLists.length > 0 ? selectedLists : selectedBlocks;
     const inserted: Node[] = [];
@@ -6031,47 +7310,54 @@ export class EditorCanvas {
       }
     } else {
       const targetTag = style === 'Numbered' ? 'OL' : 'UL';
-      if (selectedLists.length === 0) {
+      // Every block the selection touches becomes part of the list, the
+      // paragraphs between and around lists too: choosing Bulleted over three
+      // paragraphs and a list makes four bullets, as in Keynote. Converting
+      // only the lists left the paragraphs as they were, so over a pasted
+      // list that had lost its markers the choice seemed to do nothing but
+      // move the selection (Nov 2026).
+      const convertParagraphs = (run: HTMLElement[]) => {
+        if (run.length === 0) return;
         // Keep the typed-marker inference used by automatic list conversion
         // (`1.`, `2)`, `*`, `-`) while limiting it to the selected blocks.
         const source = document.createElement('div');
-        targets.forEach((block) => source.appendChild(block.cloneNode(true)));
+        run.forEach((block) => source.appendChild(block.cloneNode(true)));
         const converted = style === 'Numbered'
           ? paragraphsToOrderedList(source.innerHTML)
           : paragraphsToList(source.innerHTML);
         const template = document.createElement('template');
         template.innerHTML = converted;
         const replacements = [...template.content.childNodes];
-        const parent = targets[0].parentNode;
-        if (!parent || replacements.length === 0) return false;
-        replacements.forEach((replacement) => parent.insertBefore(replacement, targets[0]));
-        targets.forEach((block) => block.remove());
+        const parent = run[0].parentNode;
+        if (!parent || replacements.length === 0) return;
+        replacements.forEach((replacement) => parent.insertBefore(replacement, run[0]));
+        run.forEach((block) => block.remove());
         inserted.push(...replacements);
         changed = true;
-      }
-      const retagList = (list: HTMLElement): HTMLElement => {
-        if (list.tagName === targetTag) return list;
-        const replacement = document.createElement(targetTag.toLowerCase());
-        for (const attr of [...list.attributes]) {
-          if (targetTag === 'UL' && attr.name === 'start') continue;
-          replacement.setAttribute(attr.name, attr.value);
-        }
-        while (list.firstChild) replacement.appendChild(list.firstChild);
-        list.replaceWith(replacement);
-        changed = true;
-        return replacement;
       };
-      for (const block of selectedLists) {
-        if (!/^(OL|UL)$/.test(block.tagName)) continue;
+      let run: HTMLElement[] = [];
+      for (const block of selectedBlocks) {
+        if (!/^(OL|UL)$/.test(block.tagName)) {
+          run.push(block);
+          continue;
+        }
+        convertParagraphs(run);
+        run = [];
         // Sub-lists are part of the list you are converting. Leaving them at
         // their old kind is what made converting a pasted, nested list look
         // like it did nothing at all: the visible items live in the sub-list.
-        const converted = retagList(block);
+        const converted = retagList(block, style === 'Numbered');
+        if (converted !== block) changed = true;
         for (const nested of [...converted.querySelectorAll<HTMLElement>('ul, ol')]) {
-          retagList(nested);
+          if (retagList(nested, style === 'Numbered') !== nested) changed = true;
         }
+        // A marker type on an item outranks the list's (type.css), so the
+        // style chosen here only shows once the items stop overriding it.
+        if (clearListMarkerOverrides(converted)) changed = true;
         inserted.push(converted);
       }
+      convertParagraphs(run);
+      if (inserted.length === 0) return false;
       // Merge adjacent lists created from a multi-paragraph selection.
       for (let index = 1; index < inserted.length; index++) {
         const previous = inserted[index - 1] as HTMLElement;
@@ -6292,12 +7578,12 @@ export class EditorCanvas {
       if (format === 'italic' && node.style.fontStyle) {
         return node.style.fontStyle === 'italic';
       }
-      if (format === 'underline' && node.style.textDecorationLine) {
-        return node.style.textDecorationLine.includes('underline');
+      if (isDecorationFormat(format) && node.style.textDecorationLine) {
+        return node.style.textDecorationLine.includes(DECORATION_LINES[format]);
       }
       if (format === 'bold' && node.matches('b, strong')) return true;
       if (format === 'italic' && node.matches('i, em')) return true;
-      if (format === 'underline' && node.matches('u')) return true;
+      if (isDecorationFormat(format) && isDecorationTag(node, format)) return true;
     }
     const computed = start ? getComputedStyle(start) : null;
     if (baseline) return computed?.verticalAlign === baseline;
@@ -6306,7 +7592,8 @@ export class EditorCanvas {
       return computed?.fontWeight === 'bold' || weight >= 600;
     }
     if (format === 'italic') return computed?.fontStyle === 'italic';
-    return computed?.textDecorationLine.includes('underline') === true;
+    return isDecorationFormat(format)
+      && computed?.textDecorationLine.includes(DECORATION_LINES[format]) === true;
   }
 
   private applyTextSelectionStyle(property: TextRunStyleProperty, value: string): boolean {
@@ -6320,9 +7607,18 @@ export class EditorCanvas {
     return this.applyTextSelectionStyles([[property, value]], label);
   }
 
+  /**
+   * `perText`, when given, decides the declarations for each selected run in
+   * place of `declarations` (which a collapsed caret still uses): for a value
+   * that depends on what the run already has.
+   */
   private applyTextSelectionStyles(
     declarations: ReadonlyArray<readonly [TextRunStyleProperty, string]>,
     label: string,
+    perText?: (
+      text: Text,
+      content: HTMLElement,
+    ) => ReadonlyArray<readonly [TextRunStyleProperty, string]>,
   ): boolean {
     if (!this.editingId) return false;
     const content = this.slideLayer.querySelector<HTMLElement>(
@@ -6371,9 +7667,10 @@ export class EditorCanvas {
       if (end < text.data.length) text.splitText(end);
       const selected = start > 0 ? text.splitText(start) : text;
       selectedTexts.add(selected);
+      const own = perText ? perText(selected, content) : declarations;
       const applied = keepProportional && proportional[index]
-        ? declarations.filter(([property]) => property !== 'fontSize')
-        : declarations;
+        ? own.filter(([property]) => property !== 'fontSize')
+        : own;
       if (applied.length === 0) return;
       const span = document.createElement('span');
       for (const [property, value] of applied) span.style[property] = value;
@@ -6639,16 +7936,24 @@ export class EditorCanvas {
       this.commitTableDom('Change table cell typography');
       return true;
     }
-    const property = format === 'bold' ? 'fontWeight'
-      : format === 'italic' ? 'fontStyle' : 'textDecorationLine';
+    if (isDecorationFormat(format)) {
+      // Each cell keeps its own other line; see toggleTextSelectionDecoration.
+      const on = !this.tableCellTextFormatState(format);
+      const other = otherDecoration(format);
+      for (const cell of cells) {
+        cell.style.textDecorationLine = decorationLineValue({
+          [format]: on,
+          [other]: cell.style.textDecorationLine.includes(DECORATION_LINES[other]),
+        } as Record<DecorationFormat, boolean>);
+      }
+      this.commitTableDom('Change table cell typography');
+      return true;
+    }
+    const property = format === 'bold' ? 'fontWeight' : 'fontStyle';
     const active = cells.every((cell) => format === 'bold'
       ? Number.parseInt(cell.style.fontWeight, 10) >= 600
-      : format === 'italic'
-        ? cell.style.fontStyle === 'italic'
-        : cell.style.textDecorationLine.includes('underline'));
-    const value = format === 'bold' ? (active ? '400' : '700')
-      : format === 'italic' ? (active ? 'normal' : 'italic')
-        : active ? 'none' : 'underline';
+      : cell.style.fontStyle === 'italic');
+    const value = format === 'bold' ? (active ? '400' : '700') : active ? 'normal' : 'italic';
     return this.applyTableCellTextStyle(property, value);
   }
 
@@ -6674,7 +7979,7 @@ export class EditorCanvas {
       ? Number.parseInt(cell.style.fontWeight, 10) >= 600
       : format === 'italic'
         ? cell.style.fontStyle === 'italic'
-        : cell.style.textDecorationLine.includes('underline'));
+        : cell.style.textDecorationLine.includes(DECORATION_LINES[format]));
   }
 
   textComputedTypography(elementId: string): {
@@ -6816,6 +8121,53 @@ export class EditorCanvas {
     this.syncTableHeight(selected.elementId);
   }
 
+  insertTableRow(after: boolean): void {
+    const table = this.activeTable();
+    const selected = this.tableSelection;
+    if (!table || !selected) return;
+    const selectedStart = Math.min(selected.row, selected.rowEnd);
+    const selectedEnd = Math.max(selected.row, selected.rowEnd);
+    const index = insertTableRow(table, after ? selectedEnd : selectedStart, after);
+    if (index < 0) return;
+    // The new row is selected — unless merged cells running through it
+    // cover every column, in which case the selection stays on the cells it
+    // was on, which have shifted down when the row went in above them.
+    const column = Math.min(selected.column, selected.columnEnd);
+    const created = table.rows[index];
+    if (created.cells.length > 0) {
+      selected.row = index;
+      selected.rowEnd = index;
+      selected.column = Math.min(column, created.cells.length - 1);
+      selected.columnEnd = selected.column;
+    } else if (!after) {
+      selected.row += 1;
+      selected.rowEnd += 1;
+    }
+    selected.mode = 'cell';
+    selected.rows = table.rows.length;
+    this.commitTableDom('Insert table row');
+    this.syncTableHeight(selected.elementId);
+  }
+
+  deleteTableRow(): void {
+    const table = this.activeTable();
+    const selected = this.tableSelection;
+    if (!table || !selected) return;
+    const start = Math.min(selected.row, selected.rowEnd);
+    const end = Math.max(selected.row, selected.rowEnd);
+    if (end - start + 1 >= table.rows.length) return;
+    const column = Math.min(selected.column, selected.columnEnd);
+    deleteTableRows(table, start, end);
+    selected.rows = table.rows.length;
+    selected.row = Math.min(start, selected.rows - 1);
+    selected.rowEnd = selected.row;
+    selected.column = Math.max(0, Math.min(column, (table.rows[selected.row]?.cells.length ?? 1) - 1));
+    selected.columnEnd = selected.column;
+    selected.mode = 'cell';
+    this.commitTableDom(start === end ? 'Delete table row' : 'Delete table rows');
+    this.syncTableHeight(selected.elementId);
+  }
+
   private captureTextSelection(): void {
     if (!this.editingId) return;
     const selection = window.getSelection();
@@ -6925,8 +8277,11 @@ export class EditorCanvas {
       );
       if (!el || (el.type !== 'image' && el.type !== 'video')) return;
 
-      const dx = rect.x - origin.x;
-      const dy = rect.y - origin.y;
+      // A flipped picture is drawn mirrored about the window's centre, so it
+      // is held still by the opposite edge.
+      const flips = flipsOf(el);
+      const dx = flips.flipX ? rect.x + rect.w - origin.x - origin.w : rect.x - origin.x;
+      const dy = flips.flipY ? rect.y + rect.h - origin.y - origin.h : rect.y - origin.y;
       el.x = Math.round(rect.x);
       el.y = Math.round(rect.y);
       el.w = Math.max(8, Math.round(rect.w));
@@ -6934,13 +8289,66 @@ export class EditorCanvas {
       el.sourceBox = {
         w: base.w,
         h: base.h,
-        x: Math.round(base.x - dx),
-        y: Math.round(base.y - dy),
+        x: Math.round(flips.flipX ? base.x + dx : base.x - dx),
+        y: Math.round(flips.flipY ? base.y + dy : base.y - dy),
       };
     });
   }
 
   /** Topmost element containing a canvas point. */
+  /**
+   * Where lines `from`…`to` of a drawn code block sit, in slide units: from
+   * the DOM when the block is on the canvas, else from its typography.
+   */
+  private codeLineBox(
+    el: SlideElement, from: number, to: number, stageRect: DOMRect,
+  ): { top: number; height: number } | null {
+    if (el.type !== 'code') return null;
+    const body = this.slideLayer.querySelector<HTMLElement>(
+      `[data-element-id="${CSS.escape(el.id)}"] > .code-body`,
+    );
+    const first = body?.querySelector<HTMLElement>(`:scope > .code-line[data-line="${from}"]`);
+    const last = body?.querySelector<HTMLElement>(`:scope > .code-line[data-line="${to}"]`);
+    if (first && last && !el.rot) {
+      const a = first.getBoundingClientRect();
+      const b = last.getBoundingClientRect();
+      if (a.height > 0) {
+        const top = (a.top - stageRect.top) / this.scale;
+        return { top, height: (b.bottom - a.top) / this.scale };
+      }
+    }
+    const lineHeight = el.fontSize * CODE_LINE_HEIGHT;
+    return {
+      top: el.y + el.fontSize * CODE_PADDING_EM[0] + (from - 1) * lineHeight,
+      height: (to - from + 1) * lineHeight,
+    };
+  }
+
+  /**
+   * The line whose gutter a press landed in, on a drawn code block: the line
+   * numbers, or the margin left of the code when it has none. Null for a
+   * press on the code itself.
+   */
+  private codeGutterLine(elementId: string, ev: PointerEvent): number | null {
+    const body = this.slideLayer.querySelector<HTMLElement>(
+      `[data-element-id="${CSS.escape(elementId)}"] > .code-body`,
+    );
+    if (!body) return null;
+    const bodyRect = body.getBoundingClientRect();
+    if (ev.clientX < bodyRect.left) return null;
+    for (const line of body.querySelectorAll<HTMLElement>(':scope > .code-line')) {
+      const rect = line.getBoundingClientRect();
+      if (ev.clientY < rect.top || ev.clientY >= rect.bottom) continue;
+      const gutter = line.querySelector<HTMLElement>('.code-gutter');
+      const right = gutter
+        ? gutter.getBoundingClientRect().right
+          + (Number.parseFloat(getComputedStyle(gutter).marginRight) || 0) * this.scale * 0.5
+        : rect.left;
+      return ev.clientX <= right ? Number(line.dataset.line) : null;
+    }
+    return null;
+  }
+
   private hitTest(point: { x: number; y: number }): SlideElement | null {
     const slide = this.store.slide;
     if (!slide) return null;
@@ -7323,12 +8731,15 @@ function sameStructure(a: Slide, b: Slide, ignoreHtml = false): boolean {
       JSON.stringify(x.effects ?? []) !== JSON.stringify(y.effects ?? [])
     ) return false;
     // Shape paint and kind live on SVG children; wrapper-only updates cannot
-    // apply them. Rebuild when they change (including rect -> ellipse).
+    // apply them. Rebuild when they change (including rect -> ellipse). The
+    // path itself is geometry: the patch redraws the SVG (`syncShapeBody`),
+    // so dragging a point does not rebuild the slide on every frame.
     if (x.type === 'shape' && y.type === 'shape') {
       if (
         x.shape !== y.shape || x.fill !== y.fill || x.stroke !== y.stroke ||
         x.strokeWidth !== y.strokeWidth || x.radius !== y.radius ||
-        x.path !== y.path || x.arrowStart !== y.arrowStart || x.arrowEnd !== y.arrowEnd ||
+        x.arrowStart !== y.arrowStart || x.arrowEnd !== y.arrowEnd || x.strokeStyle !== y.strokeStyle ||
+        x.strokeDash !== y.strokeDash || x.startCap !== y.startCap || x.endCap !== y.endCap ||
         Boolean(x.control) !== Boolean(y.control)
       ) return false;
     }
@@ -7343,8 +8754,13 @@ function sameStructure(a: Slide, b: Slide, ignoreHtml = false): boolean {
   return true;
 }
 
+/** A point on the canvas's own pixel grid, where the pen and point drags put points. */
+function wholePixel(point: XY): XY {
+  return { x: Math.round(point.x), y: Math.round(point.y) };
+}
+
 /** Axis-aligned bounds of an element as rendered (rotation about its centre). */
-function rotatedBounds(el: SlideElement): Rect {
+export function rotatedBounds(el: SlideElement): Rect {
   if (!el.rot) return { x: el.x, y: el.y, w: el.w, h: el.h };
   const rad = (el.rot * Math.PI) / 180;
   const cos = Math.abs(Math.cos(rad));
@@ -7405,6 +8821,10 @@ export function rectContainsPoint(
     x = cx + dx * Math.cos(rad) - dy * Math.sin(rad);
     y = cy + dx * Math.sin(rad) + dy * Math.cos(rad);
   }
+  // A flipped element's rect is drawn mirrored about the element's centre.
+  const { flipX, flipY } = flipsOf(el);
+  if (flipX) x = 2 * el.x + el.w - x;
+  if (flipY) y = 2 * el.y + el.h - y;
   return x >= rect.x && x <= rect.x + rect.w && y >= rect.y && y <= rect.y + rect.h;
 }
 
@@ -7445,6 +8865,17 @@ export function elementContainsPoint(
     const nearestY = start.y + t * vy;
     return Math.hypot(point.x - nearestX, point.y - nearestY) <=
       Math.max(tolerance, el.strokeWidth / 2);
+  }
+  // An unfilled path — a line drawn with the pen, outline art — is hit along
+  // its stroke, as a line is; its box is mostly empty slide.
+  if (el.type === 'shape' && el.shape === 'path' && !visiblePaint(el.fill)) {
+    const paths = pathOnCanvas(el);
+    if (paths) {
+      const size = el.pathSize ?? { w: el.w, h: el.h };
+      const width = el.strokeWidth * Math.sqrt((el.w / size.w) * (el.h / size.h));
+      const hit = nearestOnPath(paths, point);
+      return hit !== null && hit.distance <= Math.max(tolerance, width / 2);
+    }
   }
   // Rotated elements render about their centre; undo the rotation on the
   // point so the axis-aligned bounds check matches what's on screen.
@@ -7634,28 +9065,7 @@ export function hasEndpoints(el: SlideElement): boolean {
   return el.type === 'shape' && (el.shape === 'line' || el.shape === 'arrow' || el.shape === 'brace');
 }
 
-/**
- * The two endpoints of a line/arrow/brace element in canvas coordinates. The shape
- * renders from the box's left-centre to right-centre, rotated about the
- * box centre — so endpoints are derived, not stored.
- */
-export function lineEndpoints(el: {
-  x: number;
-  y: number;
-  w: number;
-  h: number;
-  rot: number;
-}): { start: { x: number; y: number }; end: { x: number; y: number } } {
-  const cx = el.x + el.w / 2;
-  const cy = el.y + el.h / 2;
-  const rad = (el.rot * Math.PI) / 180;
-  const dx = (Math.cos(rad) * el.w) / 2;
-  const dy = (Math.sin(rad) * el.w) / 2;
-  return {
-    start: { x: cx - dx, y: cy - dy },
-    end: { x: cx + dx, y: cy + dy },
-  };
-}
+export { lineEndpoints, lineFromEndpoints } from '@shared/lineFamily.js';
 
 /**
  * Project `point` onto the nearest ray from `anchor` whose angle is a multiple
@@ -7677,19 +9087,6 @@ export function snapToAngleStep(
   const uy = Math.sin(angle);
   const length = dx * ux + dy * uy;
   return { x: anchor.x + ux * length, y: anchor.y + uy * length };
-}
-
-/** Rebuild a line element's box+rotation from two endpoints. */
-export function lineFromEndpoints(
-  start: { x: number; y: number },
-  end: { x: number; y: number },
-  h: number,
-): { x: number; y: number; w: number; h: number; rot: number } {
-  const w = Math.max(8, Math.hypot(end.x - start.x, end.y - start.y));
-  const rot = (Math.atan2(end.y - start.y, end.x - start.x) * 180) / Math.PI;
-  const cx = (start.x + end.x) / 2;
-  const cy = (start.y + end.y) / 2;
-  return { x: cx - w / 2, y: cy - h / 2, w, h, rot };
 }
 
 function unionRect(rects: Rect[]): Rect {
@@ -7850,4 +9247,37 @@ function resizePointByScale(
     x: resized.x + resized.w / 2 + localX * cos - localY * sin,
     y: resized.y + resized.h / 2 + localX * sin + localY * cos,
   };
+}
+
+/** The geometry a point drag or a bend starts from, put back before each frame of it. */
+const RESTORED_SHAPE_KEYS = [
+  'x', 'y', 'w', 'h', 'rot', 'shape', 'path', 'pathSize', 'control', 'arrowStart', 'arrowEnd', 'flipX', 'flipY',
+] as const;
+
+function restoreShape(target: ShapeEl, origin: ShapeEl): void {
+  const into = target as unknown as Record<string, unknown>;
+  const from = origin as unknown as Record<string, unknown>;
+  for (const key of RESTORED_SHAPE_KEYS) {
+    if (from[key] === undefined) delete into[key];
+    else into[key] = structuredClone(from[key]);
+  }
+}
+
+/**
+ * One frame of a bend, from the shape as the drag found it. A two-point line
+ * takes the quadratic through the pointer, and stays a line; a path bends the
+ * one segment.
+ */
+function bendPath(target: ShapeEl, drag: Extract<DragMode, { kind: 'path-bend' }>, point: XY): void {
+  restoreShape(target, drag.origin);
+  const delta = { x: point.x - drag.startCanvas.x, y: point.y - drag.startCanvas.y };
+  if (isTwoPointLine(target)) {
+    bendLine(target, drag.t, { x: drag.through.x + delta.x, y: drag.through.y + delta.y });
+    return;
+  }
+  const runs = editableRuns(target);
+  const run = runs?.[drag.sub];
+  if (!runs || !run) return;
+  bendSegment(run, drag.segment, drag.t, delta);
+  setEditableRuns(target, runs);
 }
